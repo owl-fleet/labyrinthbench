@@ -523,6 +523,7 @@ def run_session(
     n_ctx_slot: int | None = None,
     api_key: str | None = None,
     lock_host: str | None = None,
+    dump_context: str | None = None,
 ) -> dict:
     if overlay_only:
         stateless = True  # overlay-only = wipe the model's context each turn; the HUD is the entire context
@@ -678,6 +679,16 @@ def run_session(
 
         if not model_text:
             model_text = model_reasoning
+
+        if dump_context:
+            # MCV corpus sidecar: the exact context sent this turn, snapshotted BEFORE the
+            # engine advances, so a fork can replay this decision point verbatim.
+            with open(dump_context, "a") as _dc:
+                _dc.write(json.dumps({
+                    "run": run_index, "turn": turn,
+                    "call_messages": call_messages,
+                    "model_text": model_text, "model_reasoning": model_reasoning,
+                }) + "\n")
 
         if verbose:
             print(f"  [turn {turn}] model: {model_text[:200]}")
@@ -1072,6 +1083,10 @@ def main():
                     help="Repo URL/commit for the exact policy code used this run (leaderboard "
                          "integrity, Will 2026-07-14). Auto-derived from this checkout's HEAD when "
                          "omitted for built-in policies.")
+    ap.add_argument("--dump-context", default=None,
+                    help="MCV corpus sidecar: append {run, turn, call_messages, model_text, "
+                         "model_reasoning} per turn as JSONL — the exact context sent, replayable "
+                         "post-hoc by cli/mcv_probe.py.")
     ap.add_argument("--n-ctx-slot", type=int, default=None,
                     help="Journal-verified n_ctx_slot for this run's base_url host (operator-"
                          "supplied — see scripts/e1a-run-row.sh for the SSH+grep recipe). Never "
@@ -1150,6 +1165,7 @@ def main():
                     n_ctx_slot=args.n_ctx_slot,
                     api_key=args.api_key,
                     lock_host=args.lock_host,
+                    dump_context=args.dump_context,
                 )
             except Exception as e:
                 print(f"  ERROR: {e}")
