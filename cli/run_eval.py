@@ -380,8 +380,15 @@ def _llm_call(llm: httpx.Client, model: str, messages: list, retries: int = 3, o
     there does NOT suppress reasoning (verified on qwen3:14b — reasoning_len ~600 via /v1 vs 0 via
     /api/chat). We translate the native response into the OpenAI-shaped dict the caller expects. Models
     that don't support `think` (e.g. llama3.3) 400 on /api/chat → we fall back to /v1 (they don't think
-    anyway). The returned dict always carries `usage` (OpenAI-shaped) when the server reported one, on
-    either path — token-usage capture (todo-ai backlog item) reads this per turn."""
+    anyway). Non-Ollama OpenAI-compat servers (e.g. LM Studio) don't implement /api/chat at all, but
+    some answer an unknown route with HTTP 200 + an OpenAI-style {"error": ...} body instead of a
+    4xx/5xx — raise_for_status() never fires, so a bare `native_json.get("message", {})` silently
+    extracts empty content and the caller reads it as a real (blank) answer, not a failure (stranger
+    test 2026-08-04: 64 straight injected observes with nothing surfaced). An `error` key or a missing
+    `message` on the native path is therefore also treated as a failed call → fall through to /v1,
+    same as the HTTPStatusError case. The returned dict always carries `usage` (OpenAI-shaped) when
+    the server reported one, on either path — token-usage capture (todo-ai backlog item) reads this
+    per turn."""
     last_exc = None
     _base = str(llm.base_url).rstrip("/")
     _native = (_base[:-3] if _base.endswith("/v1") else _base) + "/api/chat"
@@ -395,13 +402,18 @@ def _llm_call(llm: httpx.Client, model: str, messages: list, retries: int = 3, o
                     r = llm.post(_native, json=payload)
                     r.raise_for_status()
                     native_json = r.json()
-                    m = native_json.get("message", {})
+                    if "error" in native_json or "message" not in native_json:
+                        raise ValueError(
+                            f"native /api/chat returned no message: {native_json.get('error', native_json)!r}"
+                        )
+                    m = native_json["message"]
                     return {
                         "choices": [{"message": {"content": m.get("content", ""), "reasoning": m.get("thinking", "")}}],
                         "usage": _native_usage(native_json),
                     }
-                except httpx.HTTPStatusError:
-                    pass  # model likely doesn't support `think` → fall through to the OpenAI path
+                except (httpx.HTTPStatusError, ValueError):
+                    pass  # model likely doesn't support `think`, or the server has no native endpoint
+                          # at all (200 + error body) → fall through to the OpenAI path
             payload = {"model": model, "messages": messages, "stream": False}
             if options:
                 payload["options"] = options
