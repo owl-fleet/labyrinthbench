@@ -479,6 +479,7 @@ def run_session(
     context_policy_name: str | None = None,
     policy_code_ref: str | None = None,
     n_ctx_slot: int | None = None,
+    api_key: str | None = None,
 ) -> dict:
     if overlay_only:
         stateless = True  # overlay-only = wipe the model's context each turn; the HUD is the entire context
@@ -487,7 +488,8 @@ def run_session(
                       else (lambda t: t))
     client = httpx.Client(base_url=maze_url, timeout=60.0)
     llm = httpx.Client(base_url=base_url,
-                       timeout=httpx.Timeout(_LLM_TIMEOUT_SECS, connect=30.0))
+                       timeout=httpx.Timeout(_LLM_TIMEOUT_SECS, connect=30.0),
+                       headers={"Authorization": f"Bearer {api_key}"} if api_key else None)
     t_start = time.monotonic()
 
     # Create session
@@ -999,6 +1001,11 @@ def main():
                          "supplied — see scripts/e1a-run-row.sh for the SSH+grep recipe). Never "
                          "auto-detected: the --num-ctx flag is silently dropped by ollama's /v1 "
                          "endpoint, so it cannot be trusted as ground truth.")
+    ap.add_argument("--api-key", default=os.environ.get("LB_LLM_API_KEY"),
+                    help="API key sent as 'Authorization: Bearer <key>' on every request to "
+                         "--base-url (e.g. for key-authed cloud/gateway endpoints). Local Ollama/"
+                         "LM Studio ignore it. Defaults to $LB_LLM_API_KEY; never logged or "
+                         "persisted into --output/--db-url.")
     args = ap.parse_args()
 
     if (args.state_stub or args.state_label) and not args.pull_state:
@@ -1049,6 +1056,7 @@ def main():
                     context_policy_name=args.context_policy,
                     policy_code_ref=args.policy_code_ref,
                     n_ctx_slot=args.n_ctx_slot,
+                    api_key=args.api_key,
                 )
             except Exception as e:
                 print(f"  ERROR: {e}")
