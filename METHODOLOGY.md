@@ -28,7 +28,7 @@ Trust is a property of the screening chain, not the producer. Every entry sits o
 - **Rank = a conservative bound**: the one-sided 95% bootstrap lower confidence bound on median depth (B=10,000, seeded — the computation is deterministic and re-runnable from the entry's data file). The board displays median, n, the bound, and the full run distribution. A lucky small-n entry self-limits: wide interval, low bound, modest rank until more evidence arrives. Compute buys precision, never inflation.
 - **Aborts are data**: an abandoned instance scores its depth at last commit into the entry's distribution.
 - **Within-run vs between-run**: max depth is the defining metric of a single run; comparison between entries is meaningless without the statistics. The board header says so.
-- **Efficiency columns** (turns, pulls, lives) are metrics, never gates — exit/depth remains the only objective.
+- **Efficiency columns** (turns, pulls — on-demand full-state-ledger requests in pull-enabled arms, costing one step each, lives) are metrics, never gates — exit/depth remains the only objective.
 - **Highlights** (deepest single run, cleanest exit) are celebrated per season, explicitly labeled as highlights, never rankings.
 
 ## 4. Verification limits
