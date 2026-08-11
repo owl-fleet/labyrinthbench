@@ -19,12 +19,27 @@ cell, 2026-07-21), so they are null except where verifiable: the pinned-lane
 qwen3:14b digest is registry-unmodified since 2026-05-21 (pre-campaign) and
 identical on both run hosts, so today's manifest digest IS the as-run digest.
 
-Usage: python3 cli/seed_entries.py [--src results/e1a-table1/e1a_table1.json] [--out entries]
+Usage (aggregate — the E1a campaign path):
+  python3 cli/seed_entries.py [--src results/e1a-table1/e1a_table1.json] [--out entries]
+
+Usage (--single — a lone run/instance, no e1a_table1.py aggregate needed):
+  python3 cli/seed_entries.py --single results.jsonl --entry-id my-entry --model-id my-model
+    [--lane model|harness] [--arm-name control] [--display "My Model"] [--planned-n N]
+    [--harness-name standard --harness-summary "..."] [--ceiling-row] [--out entries]
+
+  Until the dealer/runner flow ships (METHODOLOGY.md §5), a lone results JSONL — one dealt
+  instance, one or a handful of runs — has no tool-made path to a board entry short of
+  hand-editing one to match this script's schema; --single is that path. It reuses
+  cli/e1a_table1.py's cell_metrics() for the runs-block aggregation (same field names
+  seed_entries already expects) and the identical seeded-bootstrap score_block() below, so a
+  --single entry scores exactly like an aggregate one and verifies with
+  `cli/verify.py --entry` the same way.
 """
 import argparse
 import json
 import random
 import statistics
+import sys
 from pathlib import Path
 
 BOOTSTRAP_B = 10_000
@@ -138,11 +153,80 @@ def base_entry(entry_id, lane, src_rel, arm_name):
     }
 
 
+def single_entry(args) -> None:
+    """Build ONE board entry directly from a plain results JSONL (one row per run, n can be 1),
+    bypassing the e1a_table1.py campaign aggregator entirely — see the --single usage note in the
+    module docstring. Reuses cli/e1a_table1.py's cell_metrics() so the runs-block fields line up
+    with runs_block() below exactly as they do for the aggregate path."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from cli.e1a_table1 import cell_metrics  # noqa: E402 — only needed in --single mode
+
+    if not args.entry_id or not args.model_id:
+        raise SystemExit("--single requires --entry-id and --model-id")
+
+    src = Path(args.single)
+    valid, errors = [], []
+    with open(src) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if "error" in row:
+                errors.append(str(row["error"]))
+            else:
+                valid.append(row)
+    if not valid:
+        raise SystemExit(f"REFUSED: no valid run rows in {src} (n_error={len(errors)})")
+
+    arm = cell_metrics(valid, errors)
+
+    out = Path(args.out)
+    out.mkdir(exist_ok=True)
+    entry = base_entry(args.entry_id, args.lane, str(src), args.arm_name)
+    entry["declared"] = {
+        "planned_n": args.planned_n if args.planned_n is not None else arm["n_valid"],
+        "source": str(src),
+    }
+    model = model_block(args.model_id)
+    if args.display:
+        model["display"] = args.display
+    entry["pinned_model" if args.lane == "harness" else "model"] = model
+    entry["harness"] = {"name": args.harness_name, "summary": args.harness_summary, "open": True}
+    entry["ceiling_row"] = bool(args.ceiling_row)
+    entry["runs"] = runs_block(arm)
+    entry["score"] = score_block(arm, f"{BOOTSTRAP_SEED}:{args.entry_id}:single")
+
+    path = out / f"{entry['entry_id']}.json"
+    path.write_text(json.dumps(entry, indent=1) + "\n")
+    print(f"wrote 1 entry (n={arm['n_valid']} valid runs, {len(errors)} error rows skipped) -> {path}")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--src", default="results/e1a-table1/e1a_table1.json")
+    ap.add_argument("--src", default="results/e1a-table1/e1a_table1.json",
+                    help="Aggregate mode (default): results/e1a-table1/e1a_table1.json from cli/e1a_table1.py.")
     ap.add_argument("--out", default="entries")
+    ap.add_argument("--single", metavar="JSONL", default=None,
+                    help="Single-run/instance mode: a plain results JSONL (one row per run) instead "
+                         "of the e1a_table1.py aggregate. Requires --entry-id and --model-id.")
+    ap.add_argument("--entry-id", default=None, help="--single mode: entry_id and output filename stem.")
+    ap.add_argument("--model-id", default=None,
+                    help="--single mode: model key — looked up in DISPLAY/PROVENANCE if it matches "
+                         "an existing key, else used verbatim as both id and display.")
+    ap.add_argument("--lane", choices=["model", "harness"], default="model", help="--single mode: leaderboard lane.")
+    ap.add_argument("--arm-name", default="control", help="--single mode: source.arm label.")
+    ap.add_argument("--display", default=None, help="--single mode: override the model display name.")
+    ap.add_argument("--harness-name", default="standard", help="--single mode: harness.name field.")
+    ap.add_argument("--harness-summary", default="", help="--single mode: harness.summary field.")
+    ap.add_argument("--planned-n", type=int, default=None,
+                    help="--single mode: declared.planned_n (default: the JSONL's own valid-run count).")
+    ap.add_argument("--ceiling-row", action="store_true", help="--single mode: mark ceiling_row true.")
     args = ap.parse_args()
+
+    if args.single:
+        single_entry(args)
+        return
 
     src = Path(args.src)
     out = Path(args.out)
