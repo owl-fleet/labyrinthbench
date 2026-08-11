@@ -1083,6 +1083,17 @@ def main():
                 line += f"  chain_acc={f'{ca:.0%}' if ca is not None else 'n/a'}"
                 line += f"  consistency={f'{kc:.0%}' if kc is not None else 'n/a'}"
             print(line)
+            # A DNF (budget exhausted / trapped / out-of-lives — anything short of found_exit) used
+            # to print only the same one-line status above, indistinguishable from a healthy run at
+            # a glance and invisible to anything that only checks the exit code. Loud stderr here so
+            # an unreachable endpoint or a broken harness doesn't read as quiet success (an "error"
+            # result already gets its own ERROR line above — don't double-print for that case).
+            if not result.get("found_exit") and "error" not in result:
+                print(
+                    f"  DNF ✗  reason={result.get('failure_reason', 'unknown')}"
+                    f"  turns={result.get('turns', '?')}  ramp_depth={result.get('ramp_depth', '?')}",
+                    file=sys.stderr,
+                )
     finally:
         _release_lock(args.base_url)
 
@@ -1104,6 +1115,15 @@ def main():
     if kc_vals:
         print(f"  Knowledge-state consistency: {sum(kc_vals)/len(kc_vals):.0%}  (executed the program vs guessed)")
     print(f"  Results written to: {output_path}")
+
+    # Process exit code: every run above ALWAYS executes and gets written to --output regardless of
+    # outcome (a DNF never truncates a multi-run aggregate flow — the loop has no early-exit on a
+    # bad result), so a real campaign's partial DNF rate is data, not a harness fault, and stays
+    # exit 0. But the process used to report success (exit 0) even when NOTHING found the exit —
+    # for --runs 1 that's simply "the run DNF'd" reported as a pass. Zero successes across the
+    # whole batch is unambiguous: fail loud.
+    if found == 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
