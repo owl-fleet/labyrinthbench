@@ -1,4 +1,4 @@
-"""DEG (Directed Evaluation Graph) loader and pre-computation utilities."""
+"""DEG (deterministic evaluation graph) loader and pre-computation utilities."""
 from __future__ import annotations
 
 from collections import deque

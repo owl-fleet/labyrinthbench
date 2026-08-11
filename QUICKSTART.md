@@ -5,7 +5,7 @@ Get a local model running the maze and watch it live in your browser. No git, no
 ## What you need
 
 1. **Docker Desktop** — [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop). Install it, start it, leave it running.
-2. **A local model server.** These steps use **LM Studio**; Ollama differences are at the bottom.
+2. **A local model server.** These steps use **LM Studio** — if you don't already have it, download it from [lmstudio.ai](https://lmstudio.ai), install it, and open it. Already run Ollama instead? Differences are at the bottom.
 3. **This repo as a ZIP** — green **Code** button on the GitHub page → **Download ZIP** → extract it somewhere you can find (e.g. `Documents\labyrinth-bench`).
 
 ## Step 1 — start your model server

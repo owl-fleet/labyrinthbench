@@ -380,8 +380,15 @@ def _llm_call(llm: httpx.Client, model: str, messages: list, retries: int = 3, o
     there does NOT suppress reasoning (verified on qwen3:14b — reasoning_len ~600 via /v1 vs 0 via
     /api/chat). We translate the native response into the OpenAI-shaped dict the caller expects. Models
     that don't support `think` (e.g. llama3.3) 400 on /api/chat → we fall back to /v1 (they don't think
-    anyway). The returned dict always carries `usage` (OpenAI-shaped) when the server reported one, on
-    either path — token-usage capture (todo-ai backlog item) reads this per turn."""
+    anyway). Non-Ollama OpenAI-compat servers (e.g. LM Studio) don't implement /api/chat at all, but
+    some answer an unknown route with HTTP 200 + an OpenAI-style {"error": ...} body instead of a
+    4xx/5xx — raise_for_status() never fires, so a bare `native_json.get("message", {})` silently
+    extracts empty content and the caller reads it as a real (blank) answer, not a failure (stranger
+    test 2026-08-04: 64 straight injected observes with nothing surfaced). An `error` key or a missing
+    `message` on the native path is therefore also treated as a failed call → fall through to /v1,
+    same as the HTTPStatusError case. The returned dict always carries `usage` (OpenAI-shaped) when
+    the server reported one, on either path — token-usage capture (todo-ai backlog item) reads this
+    per turn."""
     last_exc = None
     _base = str(llm.base_url).rstrip("/")
     _native = (_base[:-3] if _base.endswith("/v1") else _base) + "/api/chat"
@@ -395,13 +402,18 @@ def _llm_call(llm: httpx.Client, model: str, messages: list, retries: int = 3, o
                     r = llm.post(_native, json=payload)
                     r.raise_for_status()
                     native_json = r.json()
-                    m = native_json.get("message", {})
+                    if "error" in native_json or "message" not in native_json:
+                        raise ValueError(
+                            f"native /api/chat returned no message: {native_json.get('error', native_json)!r}"
+                        )
+                    m = native_json["message"]
                     return {
                         "choices": [{"message": {"content": m.get("content", ""), "reasoning": m.get("thinking", "")}}],
                         "usage": _native_usage(native_json),
                     }
-                except httpx.HTTPStatusError:
-                    pass  # model likely doesn't support `think` → fall through to the OpenAI path
+                except (httpx.HTTPStatusError, ValueError):
+                    pass  # model likely doesn't support `think`, or the server has no native endpoint
+                          # at all (200 + error body) → fall through to the OpenAI path
             payload = {"model": model, "messages": messages, "stream": False}
             if options:
                 payload["options"] = options
@@ -467,6 +479,7 @@ def run_session(
     context_policy_name: str | None = None,
     policy_code_ref: str | None = None,
     n_ctx_slot: int | None = None,
+    api_key: str | None = None,
 ) -> dict:
     if overlay_only:
         stateless = True  # overlay-only = wipe the model's context each turn; the HUD is the entire context
@@ -475,7 +488,8 @@ def run_session(
                       else (lambda t: t))
     client = httpx.Client(base_url=maze_url, timeout=60.0)
     llm = httpx.Client(base_url=base_url,
-                       timeout=httpx.Timeout(_LLM_TIMEOUT_SECS, connect=30.0))
+                       timeout=httpx.Timeout(_LLM_TIMEOUT_SECS, connect=30.0),
+                       headers={"Authorization": f"Bearer {api_key}"} if api_key else None)
     t_start = time.monotonic()
 
     # Create session
@@ -987,6 +1001,11 @@ def main():
                          "supplied — see scripts/e1a-run-row.sh for the SSH+grep recipe). Never "
                          "auto-detected: the --num-ctx flag is silently dropped by ollama's /v1 "
                          "endpoint, so it cannot be trusted as ground truth.")
+    ap.add_argument("--api-key", default=os.environ.get("LB_LLM_API_KEY"),
+                    help="API key sent as 'Authorization: Bearer <key>' on every request to "
+                         "--base-url (e.g. for key-authed cloud/gateway endpoints). Local Ollama/"
+                         "LM Studio ignore it. Defaults to $LB_LLM_API_KEY; never logged or "
+                         "persisted into --output/--db-url.")
     args = ap.parse_args()
 
     if (args.state_stub or args.state_label) and not args.pull_state:
@@ -1037,6 +1056,7 @@ def main():
                     context_policy_name=args.context_policy,
                     policy_code_ref=args.policy_code_ref,
                     n_ctx_slot=args.n_ctx_slot,
+                    api_key=args.api_key,
                 )
             except Exception as e:
                 print(f"  ERROR: {e}")
@@ -1063,6 +1083,17 @@ def main():
                 line += f"  chain_acc={f'{ca:.0%}' if ca is not None else 'n/a'}"
                 line += f"  consistency={f'{kc:.0%}' if kc is not None else 'n/a'}"
             print(line)
+            # A DNF (budget exhausted / trapped / out-of-lives — anything short of found_exit) used
+            # to print only the same one-line status above, indistinguishable from a healthy run at
+            # a glance and invisible to anything that only checks the exit code. Loud stderr here so
+            # an unreachable endpoint or a broken harness doesn't read as quiet success (an "error"
+            # result already gets its own ERROR line above — don't double-print for that case).
+            if not result.get("found_exit") and "error" not in result:
+                print(
+                    f"  DNF ✗  reason={result.get('failure_reason', 'unknown')}"
+                    f"  turns={result.get('turns', '?')}  ramp_depth={result.get('ramp_depth', '?')}",
+                    file=sys.stderr,
+                )
     finally:
         _release_lock(args.base_url)
 
@@ -1084,6 +1115,15 @@ def main():
     if kc_vals:
         print(f"  Knowledge-state consistency: {sum(kc_vals)/len(kc_vals):.0%}  (executed the program vs guessed)")
     print(f"  Results written to: {output_path}")
+
+    # Process exit code: every run above ALWAYS executes and gets written to --output regardless of
+    # outcome (a DNF never truncates a multi-run aggregate flow — the loop has no early-exit on a
+    # bad result), so a real campaign's partial DNF rate is data, not a harness fault, and stays
+    # exit 0. But the process used to report success (exit 0) even when NOTHING found the exit —
+    # for --runs 1 that's simply "the run DNF'd" reported as a pass. Zero successes across the
+    # whole batch is unambiguous: fail loud.
+    if found == 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
