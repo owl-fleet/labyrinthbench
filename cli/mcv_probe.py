@@ -50,12 +50,41 @@ def gate_chain(deg_path: str) -> list[dict]:
 
 
 def gate_for_turn(rec: dict, chain: list[dict]) -> dict | None:
-    """Identify which gate this decision point faces by matching the problem text
-    in the LAST user (engine) message. Linear corridor => problems are unique."""
+    """Identify which gate this decision point faces.
+
+    Fresh exposure: the gate's problem text appears verbatim in the LAST user (engine)
+    message — the paths listing from observe() restates it (linear corridor => problems
+    are unique, so the match is unambiguous).
+
+    Retry/gate-failure turns (instrument debt, chunk 01 RESULTS): a wrong LOCK answer does
+    not open the gate, and the engine's feedback ("--- LOCKED ---\nGate answer: WRONG —
+    the gate does not open.") never restates the problem text — the node's flavor
+    `description` line (e.g. "Gate 3.") is NOT the gate's `problem` ("Add 6 to your c1b
+    answer"). The old substring match therefore always missed retries, marking every one
+    un-probe-able — exactly the turns mainlines die on (s0_identity scored 92% on
+    probe-able turns yet the mainlines died at gates ~7-8; see 01-corpus-and-probe-mvp.md).
+
+    Fixed by falling back to the DEG's LINEAR CHAIN POSITION on a LOCKED turn: nav-3 is a
+    strict corridor with LOCK-only gates (no wrong_destination routing — see nav-3.yaml),
+    so a locked-retry turn is, by construction, still facing the first unsolved gate in
+    chain order. solved_ledger() already derives that position deterministically from
+    committed-CORRECT history in the same call_messages — no LLM call, no engine
+    interaction, consistent with the frozen-decision-point design (measurement mode only).
+
+    This intentionally does NOT fire on pure exploration/backtrack turns (no LOCKED marker,
+    no problem text) — those stay un-probe-able, same as before, to avoid misattributing a
+    wandering turn to a stale already-solved (or not-yet-seen) gate. Do not generalize the
+    LOCKED fallback to routing DEGs (wrong_destination gates render a different "--- WRONG
+    ---" header and actually move the model) without revisiting this — chain position is
+    only exact ground truth for a pure lock corridor."""
     last_user = next((m["content"] for m in reversed(rec["call_messages"]) if m["role"] == "user"), "")
     for g in chain:
         if g["problem"] and g["problem"] in last_user:
             return g
+    if "--- LOCKED ---" in last_user:
+        solved = solved_ledger(rec["call_messages"], chain)
+        if len(solved) < len(chain):
+            return chain[len(solved)]
     return None
 
 # ---------------------------------------------------------------- ledger extraction
