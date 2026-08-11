@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from pydantic import BaseModel
 
-from engine.graph import load_all_degs, bfs_verify
+from engine.graph import load_all_degs, load_deg, bfs_verify
 from engine.runner import Session, new_session
 
 DEGS_DIR = Path(os.getenv("DEGS_DIR", Path(__file__).parent.parent / "degs"))
@@ -208,6 +208,32 @@ def _get_session(session_id: str) -> Session:
     if s is None:
         raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found.")
     return s
+
+
+def _resolve_deg(deg_id: str):
+    """Look up a DEG by id, lazy-loading it from DEGS_DIR on a cache miss.
+
+    _degs is built once at import time (module load), so a DEG minted (mint_instances.py
+    writes ``{instance_id}.yaml`` with ``meta.id == instance_id``) or otherwise dropped into
+    DEGS_DIR after the API started would 404 forever without a restart. On a miss, try
+    DEGS_DIR/{deg_id}.yaml directly — the same load + BFS-parity check run at startup — and
+    cache the result so later lookups (and /degs listings) are free.
+    """
+    deg = _degs.get(deg_id)
+    if deg is not None:
+        return deg
+    path = DEGS_DIR / f"{deg_id}.yaml"
+    if not path.exists():
+        return None
+    deg = load_deg(path)
+    _, commits = bfs_verify(deg)
+    if commits != deg.optimal_commits:
+        raise HTTPException(
+            status_code=500,
+            detail=f"DEG {deg_id!r}: BFS found {commits} commits but manifest says {deg.optimal_commits}",
+        )
+    _degs[deg_id] = deg
+    return deg
 
 
 def _event_to_sse(event, session: Session) -> dict:
@@ -727,9 +753,10 @@ def list_degs():
 
 @app.post("/session")
 def create_session(req: CreateSessionRequest):
-    if req.deg_id not in _degs:
+    deg = _resolve_deg(req.deg_id)
+    if deg is None:
         raise HTTPException(status_code=404, detail=f"DEG {req.deg_id!r} not found.")
-    session = new_session(_degs[req.deg_id])
+    session = new_session(deg)
     session.model = req.model
     if req.fog_radius is not None:
         session.fog_radius = req.fog_radius
@@ -863,9 +890,9 @@ def session_graph(session_id: str):
 @app.get("/deg/{deg_id}/graph")
 def deg_graph(deg_id: str):
     """Return Cytoscape-ready graph data for a DEG (no session needed — for history replay)."""
-    if deg_id not in _degs:
+    deg = _resolve_deg(deg_id)
+    if deg is None:
         raise HTTPException(status_code=404, detail=f"DEG {deg_id!r} not found.")
-    deg = _degs[deg_id]
     nodes, edges = _build_cy_elements(deg)
     return {
         "deg_id": deg.id,
