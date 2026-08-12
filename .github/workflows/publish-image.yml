@@ -1,0 +1,46 @@
+# publish-image — build and push ghcr.io/owl-fleet/labyrinthbench
+#
+# Publish policy (lb-launch-debt deliverable f, 2026-08-12): images are built
+# by CI, never pushed from a workstation — GHCR package creation requires the
+# Actions GITHUB_TOKEN (custom App installation tokens cannot create org
+# packages), and CI builds are reproducible from a public ref by construction.
+# Triggers: every version tag (v*), plus manual dispatch for out-of-band
+# rebuilds (base-image CVE, first publish).
+name: publish-image
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build
+        run: |
+          IMAGE=ghcr.io/owl-fleet/labyrinthbench
+          SHA_TAG=$(git rev-parse --short HEAD)
+          docker build --pull -t "$IMAGE:latest" -t "$IMAGE:$SHA_TAG" .
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            docker tag "$IMAGE:latest" "$IMAGE:${{ github.ref_name }}"
+          fi
+
+      - name: Push
+        run: |
+          IMAGE=ghcr.io/owl-fleet/labyrinthbench
+          SHA_TAG=$(git rev-parse --short HEAD)
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:$SHA_TAG"
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            docker push "$IMAGE:${{ github.ref_name }}"
+          fi
