@@ -6,7 +6,7 @@ Get a local model running the maze and watch it live in your browser. No git, no
 
 1. **Docker Desktop** — [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop). Install it, start it, leave it running.
 2. **A local model server.** These steps use **LM Studio** — if you don't already have it, download it from [lmstudio.ai](https://lmstudio.ai), install it, and open it. Already run Ollama instead? Differences are at the bottom.
-3. **This repo as a ZIP** — green **Code** button on the GitHub page → **Download ZIP** → extract it somewhere you can find (e.g. `Documents\labyrinth-bench`).
+3. **This repo as a ZIP** — green **Code** button on the GitHub page → **Download ZIP** → extract it somewhere you can find (e.g. `Documents\labyrinthbench`).
 
 ## Step 1 — start your model server
 
@@ -29,7 +29,7 @@ First run takes a few minutes while the image builds. When it returns, Labyrinth
 ## Step 3 — run the maze
 
 ```sh
-docker compose -f docker-compose.standalone.yml exec labyrinth-bench python cli/run_eval.py --model <your-model-id> --base-url http://host.docker.internal:1234/v1
+docker compose -f docker-compose.standalone.yml exec labyrinthbench python cli/run_eval.py --model <your-model-id> --base-url http://host.docker.internal:1234/v1
 ```
 
 Replace `<your-model-id>` with the identifier from Step 1. The terminal prints progress as the model plays. **Do not use `--no-think` with LM Studio** — that flag speaks Ollama's native API and produces empty responses everywhere else; LM Studio separates a thinking model's reasoning from its answer automatically, so thinking models work here without it (they just spend time thinking).
@@ -55,7 +55,7 @@ Write down anything that confused you, in the order it happened — that list is
 Ollama serves on port **11434** and uses its own model tags:
 
 ```sh
-docker compose -f docker-compose.standalone.yml exec labyrinth-bench python cli/run_eval.py --model qwen3:14b --base-url http://host.docker.internal:11434/v1
+docker compose -f docker-compose.standalone.yml exec labyrinthbench python cli/run_eval.py --model qwen3:14b --base-url http://host.docker.internal:11434/v1
 ```
 
 Qwen3-family "thinking" models: add `--no-think` for comparable runs. (`--no-think` is Ollama-only — it uses Ollama's native API; on any other server, run without it.)

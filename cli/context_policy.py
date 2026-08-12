@@ -286,7 +286,7 @@ def policy_provenance(name: str, code_ref: Optional[str] = None) -> dict:
             "policy": name,
             "generality_class": cls.generality_class,
             "source": "builtin",
-            "code_ref": code_ref or f"labyrinth-bench/cli/context_policy.py@{_repo_commit()}",
+            "code_ref": code_ref or f"labyrinthbench/cli/context_policy.py@{_repo_commit()}",
         }
     if not code_ref:
         raise ValueError(

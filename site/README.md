@@ -21,7 +21,7 @@ npm ci && npm run build   # output: _site/
 ## Regenerating entries
 
 ```bash
-python3 ../cli/seed_entries.py   # from labyrinth-bench/; writes ../entries/*.json
+python3 ../cli/seed_entries.py   # from labyrinthbench/; writes ../entries/*.json
 ```
 
 Preview tip: `?curves=N` on the leaderboard overrides the distribution-curve n-gate (default 15; `?curves=0` always draws).

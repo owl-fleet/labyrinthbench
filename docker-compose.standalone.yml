@@ -1,7 +1,7 @@
 services:
-  labyrinth-bench:
+  labyrinthbench:
     build: .
-    container_name: labyrinth-bench
+    container_name: labyrinthbench
     ports:
       - "8090:8090"
     # Lets the documented host.docker.internal base-URL resolve on Linux too

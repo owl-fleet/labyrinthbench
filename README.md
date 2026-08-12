@@ -54,7 +54,7 @@ Two commands. Point `--base-url` at whatever endpoint you already run (Ollama sh
 ```bash
 docker compose -f docker-compose.standalone.yml up -d
 
-docker compose -f docker-compose.standalone.yml exec labyrinth-bench \
+docker compose -f docker-compose.standalone.yml exec labyrinthbench \
   python cli/run_eval.py --model qwen3:14b --no-think \
   --base-url http://host.docker.internal:11434/v1
 ```
@@ -126,12 +126,12 @@ Six runs where the model keeps its full chat history, six where the harness wipe
 
 ```bash
 # control: the model keeps its full chat history
-docker compose -f docker-compose.standalone.yml exec labyrinth-bench \
+docker compose -f docker-compose.standalone.yml exec labyrinthbench \
   python cli/run_eval.py --model <your-model> --deg nav-3 --runs 6 \
   --base-url http://host.docker.internal:11434/v1 --output /results/control.jsonl
 
 # wiped: context cleared every turn; only the model's own recorded gate answers are re-injected
-docker compose -f docker-compose.standalone.yml exec labyrinth-bench \
+docker compose -f docker-compose.standalone.yml exec labyrinthbench \
   python cli/run_eval.py --model <your-model> --deg nav-3 --runs 6 \
   --base-url http://host.docker.internal:11434/v1 --overlay-only --show-recall --output /results/wiped.jsonl
 ```

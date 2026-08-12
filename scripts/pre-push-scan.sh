@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# pre-push-scan.sh — pre-push secret gate for owl-fleet/labyrinth-bench
+# pre-push-scan.sh — pre-push secret gate for owl-fleet/labyrinthbench
 #
 # WHAT THIS IS
-#   The public repo owl-fleet/labyrinth-bench is authored directly (no
+#   The public repo owl-fleet/labyrinthbench is authored directly (no
 #   fresh-history extraction step), and GitHub push protection is not
 #   available on the org's Team plan for private repos — so once the repo
 #   goes public there is no server-side secret scan backstop. This script

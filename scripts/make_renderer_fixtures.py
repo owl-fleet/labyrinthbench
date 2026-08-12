@@ -11,7 +11,7 @@ stdlib-only (no pyyaml) inside the --network none target.
   (wrong-answer routing is real maze structure — without it the dz* dead ends
   would be orphan nodes).
 
-Usage (inside the labyrinth-bench container, cwd /app):
+Usage (inside the labyrinthbench container, cwd /app):
   python3 scripts/make_renderer_fixtures.py results/trace-120b.jsonl \
       sandbox/rungs/renderer_fixtures/
 """
