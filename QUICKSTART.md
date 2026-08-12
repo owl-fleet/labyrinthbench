@@ -6,7 +6,8 @@ Get a local model running the maze and watch it live in your browser. No git, no
 
 1. **Docker Desktop** — [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop). Install it, start it, leave it running.
 2. **A local model server.** These steps use **LM Studio** — if you don't already have it, download it from [lmstudio.ai](https://lmstudio.ai), install it, and open it. Already run Ollama instead? Differences are at the bottom.
-3. **This repo as a ZIP** — green **Code** button on the GitHub page → **Download ZIP** → extract it somewhere you can find (e.g. `Documents\labyrinthbench`).
+
+That's it — the benchmark ships as a prebuilt image, so you don't need the repo on your machine. (Want to build from source instead? See the last section.)
 
 ## Step 1 — start your model server
 
@@ -18,18 +19,18 @@ In LM Studio:
 
 ## Step 2 — start LabyrinthBench
 
-Open a terminal (PowerShell is fine) in the extracted folder and run:
+Open a terminal (PowerShell is fine) anywhere and run:
 
 ```sh
-docker compose -f docker-compose.standalone.yml up -d
+docker run -d --name labyrinthbench -p 8090:8090 --add-host=host.docker.internal:host-gateway ghcr.io/owl-fleet/labyrinthbench:latest
 ```
 
-First run takes a few minutes while the image builds. When it returns, LabyrinthBench is up.
+First run downloads a ~200 MB prebuilt image. When it returns, LabyrinthBench is up.
 
 ## Step 3 — run the maze
 
 ```sh
-docker compose -f docker-compose.standalone.yml exec labyrinthbench python cli/run_eval.py --model <your-model-id> --base-url http://host.docker.internal:1234/v1
+docker exec labyrinthbench python cli/run_eval.py --model <your-model-id> --base-url http://host.docker.internal:1234/v1
 ```
 
 Replace `<your-model-id>` with the identifier from Step 1. The terminal prints progress as the model plays. **Do not use `--no-think` with LM Studio** — that flag speaks Ollama's native API and produces empty responses everywhere else; LM Studio separates a thinking model's reasoning from its answer automatically, so thinking models work here without it (they just spend time thinking).
@@ -45,7 +46,7 @@ A run ends when the model reaches the exit, runs out of wrong-answer budget, or 
 - **`connection refused` / a run that immediately records DNF with barely any steps** — the model server isn't reachable from Docker (a failed connection scores as a DNF row rather than crashing). Most common cause: **the server is listening on localhost only, which containers can't reach.** In LM Studio, enable **Serve on Local Network** in the server settings (headless CLI installs: set `"networkInterface": "0.0.0.0"` in `~/.lmstudio/.internal/http-server-config.json`, then `lms server stop && lms server start`). For Ollama: `OLLAMA_HOST=0.0.0.0`. Also check the port in `--base-url` matches the server.
 - **`host.docker.internal` not found** (mostly Linux) — replace it with your machine's LAN IP, e.g. `http://192.168.1.50:1234/v1`.
 - **You hit Ctrl-C but a session is still running** — the run continues server-side and a lock blocks new runs until it finishes; watch it wind down at `localhost:8090/watch` or wait it out. It still scores at the depth it reached.
-- **Nothing at localhost:8090** — `docker compose -f docker-compose.standalone.yml ps` should show the container up; if not, re-run Step 2 and read the error.
+- **Nothing at localhost:8090** — `docker ps` should show the `labyrinthbench` container up; if not, re-run Step 2 and read the error (`already in use` means it's still there from last time — `docker rm -f labyrinthbench` and retry).
 - **The model answers gibberish or instantly fails** — some models need a bigger context window than the server default; raise it in LM Studio's model settings (8k+ recommended).
 
 Write down anything that confused you, in the order it happened — that list is exactly what this test is for.
@@ -55,7 +56,17 @@ Write down anything that confused you, in the order it happened — that list is
 Ollama serves on port **11434** and uses its own model tags:
 
 ```sh
-docker compose -f docker-compose.standalone.yml exec labyrinthbench python cli/run_eval.py --model qwen3:14b --base-url http://host.docker.internal:11434/v1
+docker exec labyrinthbench python cli/run_eval.py --model qwen3:14b --base-url http://host.docker.internal:11434/v1
 ```
 
 Qwen3-family "thinking" models: add `--no-think` for comparable runs. (`--no-think` is Ollama-only — it uses Ollama's native API; on any other server, run without it.)
+
+## Building from source instead
+
+If you'd rather build than pull (or want the code on disk): green **Code** button on the GitHub page → **Download ZIP** → extract it (e.g. `Documents\labyrinthbench`), then from a terminal in that folder:
+
+```sh
+docker compose -f docker-compose.standalone.yml up -d
+```
+
+First run takes a few minutes while the image builds. The container gets the same name, so every command above works unchanged.

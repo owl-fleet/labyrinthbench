@@ -49,21 +49,25 @@ What you need:
 * **Any OpenAI-compatible endpoint** serving a model — the only hardware requirement is whatever your model needs.
 * **git — only if you plan to enter the harness lane** with code-linked runs; running the benchmark itself needs none.
 
-Two commands. Point `--base-url` at whatever endpoint you already run (Ollama shown; LM Studio serves on port 1234), and swap `qwen3:14b` for any model tag your server actually has.
+Two commands — the first pulls a prebuilt ~200 MB image, no repo download needed. Point `--base-url` at whatever endpoint you already run (Ollama shown; LM Studio serves on port 1234), and swap `qwen3:14b` for any model tag your server actually has.
 
 ```bash
-docker compose -f docker-compose.standalone.yml up -d
+docker run -d --name labyrinthbench -p 8090:8090 \
+  --add-host=host.docker.internal:host-gateway \
+  ghcr.io/owl-fleet/labyrinthbench:latest
 
-docker compose -f docker-compose.standalone.yml exec labyrinthbench \
+docker exec labyrinthbench \
   python cli/run_eval.py --model qwen3:14b --no-think \
   --base-url http://host.docker.internal:11434/v1
 ```
+
+Prefer building from source? Clone the repo and `docker compose -f docker-compose.standalone.yml up -d` instead of the `docker run` — everything else is identical (same container name, so the `docker exec` commands below work for both paths).
 
 Then open **<http://localhost:8090/watch>** and watch your run live, turn by turn — the same view as the GIF up top.
 
 The three things most likely to bite on a first run:
 
-* **Linux:** `host.docker.internal` works — the compose file maps it to your host gateway. If the connection refuses, your endpoint isn't listening on a host interface (bind it, or swap in your machine's LAN IP).
+* **Linux:** `host.docker.internal` works — the `--add-host` flag (and the compose file, on the source path) maps it to your host gateway. If the connection refuses, your endpoint isn't listening on a host interface (bind it, or swap in your machine's LAN IP).
 * **Qwen3-family thinking models** want `--no-think` for comparable runs (that's why it's in the example — drop it for non-thinking models). The flag is **Ollama-only** (it uses Ollama's native API); on LM Studio or any other server, run without it — thinking models still work, they just spend turns thinking.
 * **Context window:** some models need more than your server's default — 8k+ recommended.
 
@@ -126,14 +130,17 @@ Six runs where the model keeps its full chat history, six where the harness wipe
 
 ```bash
 # control: the model keeps its full chat history
-docker compose -f docker-compose.standalone.yml exec labyrinthbench \
+docker exec labyrinthbench \
   python cli/run_eval.py --model <your-model> --deg nav-3 --runs 6 \
   --base-url http://host.docker.internal:11434/v1 --output /results/control.jsonl
 
 # wiped: context cleared every turn; only the model's own recorded gate answers are re-injected
-docker compose -f docker-compose.standalone.yml exec labyrinthbench \
+docker exec labyrinthbench \
   python cli/run_eval.py --model <your-model> --deg nav-3 --runs 6 \
   --base-url http://host.docker.internal:11434/v1 --overlay-only --show-recall --output /results/wiped.jsonl
+
+# copy the JSONLs out of the container when you're done
+docker cp labyrinthbench:/results ./results
 ```
 
 (`--overlay-only --show-recall` is the exact flag pair the 13-model comparison above ran, kept so your runs match the published record; it's equivalent to `--context-policy wipe-curated`, which is the interface to reach for in your own experiments.)
