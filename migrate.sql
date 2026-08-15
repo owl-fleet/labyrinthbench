@@ -43,3 +43,10 @@ ALTER TABLE labyrinth_runs ADD COLUMN IF NOT EXISTS knowledge_state_consistency 
 -- has burned two result sets already).
 ALTER TABLE labyrinth_runs ADD COLUMN IF NOT EXISTS base_url TEXT;
 ALTER TABLE labyrinth_runs ADD COLUMN IF NOT EXISTS n_ctx_slot INT;
+
+-- Serving-stack provenance (2026-08-15): the rest of the identity tuple — engine, engine build,
+-- weights digest, quantization, CHAT TEMPLATE hash, renderer/parser, sampling, n_ctx. Added after
+-- an engine upgrade moved a benchmark score 1.000 -> 0.188 -> 1.000 on a FIXED model digest and
+-- the records could not see why: they stored `model` and little else. JSONB rather than a column
+-- per field because the tuple grows as engines expose more, and a run record is read whole.
+ALTER TABLE labyrinth_runs ADD COLUMN IF NOT EXISTS prov JSONB;

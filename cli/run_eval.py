@@ -59,6 +59,12 @@ try:
 except ImportError:
     import context_policy
 
+# Serving-stack provenance — what actually served this run, not just the tag we asked for.
+try:
+    from cli import provenance
+except ImportError:
+    import provenance
+
 _DEFAULT_DB_URL = os.environ.get("DB_URL", "")
 # Cold loads of large models (60-90 GB) can exceed 10 minutes before the first
 # byte arrives; a flat 600s read timeout cancels them mid-load. Override via env.
@@ -297,6 +303,7 @@ def _parse_action(text: str) -> dict | None:
 def _insert_run(db_url: str, score: dict, label: str | None) -> None:
     try:
         import psycopg2
+        from psycopg2.extras import Json
     except ImportError:
         print("  WARNING: psycopg2 not available — skipping DB insert")
         return
@@ -310,13 +317,14 @@ def _insert_run(db_url: str, score: dict, label: str | None) -> None:
                     found_exit, steps_to_exit, step_budget, optimal_commits,
                     normalized_efficiency, gate_accuracy, path_correctness,
                     recovery_rate, chain_gate_count, chain_accuracy, knowledge_state_consistency,
-                    note_used, elapsed_seconds, turns, run_label, base_url, n_ctx_slot
+                    note_used, elapsed_seconds, turns, run_label, base_url, n_ctx_slot, prov
                 ) VALUES (
                     %(session_id)s, %(model)s, %(deg_id)s,
                     %(found_exit)s, %(steps_to_exit)s, %(step_budget)s, %(optimal_commits)s,
                     %(normalized_efficiency)s, %(gate_accuracy)s, %(path_correctness)s,
                     %(recovery_rate)s, %(chain_gate_count)s, %(chain_accuracy)s, %(knowledge_state_consistency)s,
-                    %(note_used)s, %(elapsed_seconds)s, %(turns)s, %(run_label)s, %(base_url)s, %(n_ctx_slot)s
+                    %(note_used)s, %(elapsed_seconds)s, %(turns)s, %(run_label)s, %(base_url)s, %(n_ctx_slot)s,
+                    %(prov)s
                 )
                 """,
                 {
@@ -343,6 +351,8 @@ def _insert_run(db_url: str, score: dict, label: str | None) -> None:
                     # (ollama's /v1 endpoint silently drops --num-ctx — see run_eval.py --help).
                     "base_url": score.get("base_url"),
                     "n_ctx_slot": score.get("n_ctx_slot"),
+                    # Serving-stack identity tuple (2026-08-15) — engine/build/weights/template.
+                    "prov": Json(score["prov"]) if score.get("prov") else None,
                 },
             )
         conn.close()
@@ -1021,6 +1031,17 @@ def main():
     results = []
 
     _acquire_lock(args.model, args.deg, args.runs, args.base_url)
+
+    # Serving-stack identity, captured ONCE per invocation and stamped onto every row below.
+    # Once, not per session: the stack cannot change mid-invocation, and the probe is HTTP the
+    # scored run should not be paying for. Wrapped because describing a run must never fail it.
+    try:
+        prov = provenance.capture(args.base_url, args.model, api_key=args.api_key)
+        print(provenance.summary(prov))
+    except Exception as e:  # pragma: no cover — belt and braces; capture() already swallows
+        prov = {"error": str(e)[:200]}
+        print(f"  ! provenance capture failed (non-fatal): {e}")
+
     try:
         for i in range(args.runs):
             print(f"Run {i + 1}/{args.runs} (run_index={args.run_offset + i})")
@@ -1064,6 +1085,9 @@ def main():
 
             if args.label:
                 result["run_label"] = args.label
+            # Stamped on EVERY row, including error/DNF rows: a run that failed is exactly the one
+            # you later need to attribute to a serving stack.
+            result["prov"] = prov
             results.append(result)
             with open(output_path, "a") as f:
                 f.write(json.dumps(result) + "\n")
