@@ -418,7 +418,12 @@ def _llm_call(llm: httpx.Client, model: str, messages: list, retries: int = 3, o
                         )
                     m = native_json["message"]
                     return {
-                        "choices": [{"message": {"content": m.get("content", ""), "reasoning": m.get("thinking", "")}}],
+                        "choices": [{
+                            "message": {"content": m.get("content", ""), "reasoning": m.get("thinking", "")},
+                            # Native /api/chat reports truncation as done_reason="length". Surfaced
+                            # under the OpenAI key so the caller has ONE thing to check (2026-08-22).
+                            "finish_reason": native_json.get("done_reason"),
+                        }],
                         "usage": _native_usage(native_json),
                     }
                 except (httpx.HTTPStatusError, ValueError):
@@ -569,6 +574,7 @@ def run_session(
         messages.append({"role": "user", "content": current_engine_text})
 
     turn = 0
+    truncated_turns = 0   # turns the model was cut off mid-generation (finish_reason=length)
     norm_action_count = 0
     look_gate_interceptions = 0
     # Look-gate arm (the cheapest-instrument baseline): a deterministic pre-commit interceptor
@@ -621,9 +627,27 @@ def run_session(
         llm_json = _llm_call(llm, model, call_messages, options=options, think=False if no_think else None)
         _update_heartbeat(base_url)
         usage = llm_json.get("usage")
-        msg = llm_json["choices"][0]["message"]
+        choice = llm_json["choices"][0]
+        msg = choice["message"]
+        finish_reason = choice.get("finish_reason")
         model_text = msg.get("content") or ""
         model_reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
+
+        # TRUNCATION IS AN INSTRUMENT FAILURE, NOT A MODEL FAILURE (2026-08-22).
+        # A thinking model that hits its output ceiling spends the whole budget reasoning and
+        # emits NO answer — measured on qwen3.6:27b: max_tokens 100 and 200 both returned
+        # finish_reason="length" with empty content. The fallback below would then hand raw
+        # reasoning text to _parse_action, which finds no JSON, warns, and injects an observe —
+        # so a truncated turn was indistinguishable from the model declining to act, and nothing
+        # in this file read finish_reason at all. Record it loudly instead.
+        truncated = (finish_reason == "length")
+        if truncated:
+            print(f"  [turn {turn}] TRUNCATED: hit the output ceiling "
+                  f"(finish_reason=length, completion_tokens={(usage or {}).get('completion_tokens')}) "
+                  f"— this turn is an INSTRUMENT failure, not a model decision",
+                  file=sys.stderr, flush=True)
+            truncated_turns += 1
+
         if not model_text:
             model_text = model_reasoning
 
@@ -804,16 +828,17 @@ def run_session(
                 "turn": turn, "model_text": model_text, "model_reasoning": model_reasoning,
                 "action_parsed": action, "engine_text": engine_text,
                 "usage": usage, "context_telemetry": _asdict_or_none(turn_telem),
+                "truncated": truncated,
             })
         elif stateless:
-            turns_log.append({"turn": turn, "model_text": model_text, "model_reasoning": model_reasoning, "action_parsed": action, "engine_text": engine_text, "injected_history": None})
+            turns_log.append({"turn": turn, "model_text": model_text, "model_reasoning": model_reasoning, "action_parsed": action, "engine_text": engine_text, "injected_history": None, "truncated": truncated})
         else:
             history_block = _build_history_block(decision_history) if inject_history else ""
             if kos_prompt:
                 user_content = _build_kos_state_block(kos_state) + engine_text
             else:
                 user_content = engine_text + history_block
-            turns_log.append({"turn": turn, "model_text": model_text, "model_reasoning": model_reasoning, "action_parsed": action, "engine_text": engine_text, "injected_history": history_block or None})
+            turns_log.append({"turn": turn, "model_text": model_text, "model_reasoning": model_reasoning, "action_parsed": action, "engine_text": engine_text, "injected_history": history_block or None, "truncated": truncated})
             messages.append({"role": "user", "content": user_content})
         completed = act_data.get("completed", False)
 
@@ -876,6 +901,10 @@ def run_session(
     score_data["pull_state"] = pull_state
     score_data["state_stub"] = state_stub
     score_data["state_label"] = state_label
+    # Non-zero means the model was cut off mid-generation on that many turns, so those turns are
+    # instrument artifacts, not model decisions. A row with truncated_turns > 0 must not be read
+    # as a clean measurement of the arm (2026-08-22).
+    score_data["truncated_turns"] = truncated_turns
     score_data["turns_log"] = turns_log
 
     # Provenance columns (lb-post-release chunk 02 — the standing gate): base_url is always
