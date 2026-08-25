@@ -665,7 +665,8 @@ def main() -> None:
     p.add_argument("--maze-url", default=MAZE_URL)
     p.add_argument("--solver", action="store_true")
     p.add_argument("--model", default="qwen3:14b")
-    p.add_argument("--base-url", default="http://localhost:11434/v1")
+    p.add_argument("--base-url", default=os.environ.get("LB_BASE_URL", "http://localhost:11434/v1"),
+                    help="Default: $LB_BASE_URL, else http://localhost:11434/v1.")
     p.add_argument("--no-think", action="store_true")
     p.add_argument("--verbose", action="store_true")
     p.add_argument(

@@ -80,8 +80,19 @@ def capture(base_url: str, model: str, api_key: str | None = None,
             timeout: float = _TIMEOUT) -> dict:
     """Best-effort identity tuple for `model` as served at `base_url` (an OpenAI /v1 URL).
 
-    Unlike a gateway-fronted setup, the endpoint being probed is exactly the one the run talks to,
-    so there is no guessing about which host owns the model.
+    When `base_url` names one physical host directly, the endpoint probed is exactly the one
+    the run talks to — no guessing about which host owns the model.
+
+    When `base_url` is a multi-upstream gateway fronting several physical hosts (a documented
+    pattern this file does not otherwise need to know about — see run_eval.py's --lock-host),
+    correctness depends on how each probe below routes: a request the gateway can inspect for a
+    `model` field (this file's own POST to /api/show, and any gateway that answers /api/tags as a
+    genuinely per-model merge) resolves to the right host; a bodyless GET the gateway cannot
+    attribute to a model (/api/version, llama.cpp's /props) may resolve to whatever upstream that
+    gateway treats as its default, which is not necessarily the host serving `model`. Concretely:
+    `weights_digest` and the ollama `quantization`/`sampling`/`template_sha`/`renderer` fields stay
+    correct through such a gateway; `engine_build` (the /api/version probe) can mislabel — flagged
+    here rather than worked around, since fixing a specific gateway's routing is that gateway's job.
     """
     base = (base_url or "").rstrip("/")
     parsed = urlparse(base)

@@ -43,7 +43,8 @@ OK, WARN, FAIL = "  ✓", "  !", "  ✗"
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True, help="model tag you intend to pass to run_eval.py")
-    ap.add_argument("--base-url", default="http://localhost:11434/v1")
+    ap.add_argument("--base-url", default=os.environ.get("LB_BASE_URL", "http://localhost:11434/v1"),
+                    help="Default: $LB_BASE_URL, else http://localhost:11434/v1.")
     ap.add_argument("--maze-url", default="http://localhost:8090")
     args = ap.parse_args()
 

@@ -122,7 +122,8 @@ def run_session(rung_gen, base_url: str, model: str, arm: str, *,
                 seed: int | None, verbose: bool,
                 exec_timeout: int = 30, thrash_n: int = 4,
                 hard_backstop: int = 120, stall_turns: int = 0,
-                stream_url: str | None = None, label: str | None = None) -> dict:
+                stream_url: str | None = None, label: str | None = None,
+                lock_host: str | None = None) -> dict:
     rung = rung_gen(seed)
     has_np = arm in NOTEPAD_ARMS
     wipe = arm in WIPE_ARMS
@@ -224,7 +225,7 @@ def run_session(rung_gen, base_url: str, model: str, arm: str, *,
 
             llm_json = _llm_call(llm, model, call_messages, options=options,
                                  think=False if no_think else None)
-            _update_heartbeat(base_url)
+            _update_heartbeat(base_url, lock_host)
             msg = llm_json["choices"][0]["message"]
             text = msg.get("content") or ""
             reasoning = msg.get("reasoning") or ""
@@ -363,7 +364,14 @@ def main():
     ap.add_argument("--rung", default="0", help="rung id (0 | 1)")
     ap.add_argument("--arm", required=True, choices=ARMS)
     ap.add_argument("--model", required=True)
-    ap.add_argument("--base-url", default="http://localhost:11434/v1")
+    ap.add_argument("--base-url", default=os.environ.get("LB_BASE_URL", "http://localhost:11434/v1"),
+                    help="OpenAI-compatible endpoint. Default: $LB_BASE_URL, else "
+                         "http://localhost:11434/v1.")
+    ap.add_argument("--lock-host", default=os.environ.get("LB_LOCK_HOST") or None,
+                    help="Operator override for the VRAM run-lock key and the `via_gateway` "
+                         "audit column — set when --base-url is a multi-upstream gateway. "
+                         "See run_eval.py's module docstring ('Locking through a gateway'). "
+                         "Default: $LB_LOCK_HOST, else derived from --base-url's hostname.")
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--no-think", action="store_true")
@@ -389,7 +397,7 @@ def main():
     results = []
 
     _require_image(args.image)
-    _acquire_lock(args.model, f"sandbox-{args.rung}-{args.arm}", args.runs, args.base_url)
+    _acquire_lock(args.model, f"sandbox-{args.rung}-{args.arm}", args.runs, args.base_url, args.lock_host)
     try:
         for i in range(args.runs):
             print(f"Run {i + 1}/{args.runs}  ({args.arm}, {args.model})")
@@ -401,6 +409,7 @@ def main():
                     seed=seed, verbose=args.verbose, exec_timeout=args.exec_timeout,
                     hard_backstop=args.backstop, stall_turns=args.stall_turns,
                     stream_url=args.stream_url, label=args.label,
+                    lock_host=args.lock_host,
                 )
             except Exception as e:
                 print(f"  ERROR: {type(e).__name__}: {e}")
@@ -408,6 +417,12 @@ def main():
                           "seed": seed, "error": f"{type(e).__name__}: {e}"}
             if args.label:
                 result["run_label"] = args.label
+            # Provenance columns (confined-effector-gateway chunk 08 — mirrors run_eval.py):
+            # base_url is always known; via_gateway is derived from the operator-supplied
+            # --lock-host, never guessed, so "was this cell gated?" is answerable from the row.
+            result["base_url"] = args.base_url
+            result["lock_host"] = args.lock_host
+            result["via_gateway"] = bool(args.lock_host)
             results.append(result)
             with open(out_path, "a") as f:
                 f.write(json.dumps(result) + "\n")
@@ -430,7 +445,7 @@ def main():
                       f"{'!' * 72}", flush=True)
                 sys.exit(2)
     finally:
-        _release_lock(args.base_url)
+        _release_lock(args.base_url, args.lock_host)
 
     depths = [r["subgoal_depth"] for r in results if r.get("subgoal_depth") is not None]
     colls = [r["collateral_count"] for r in results if r.get("collateral_count") is not None]

@@ -71,6 +71,8 @@ The three things most likely to bite on a first run:
 * **Qwen3-family thinking models** want `--no-think` for comparable runs (that's why it's in the example — drop it for non-thinking models). The flag is **Ollama-only** (it uses Ollama's native API); on LM Studio or any other server, run without it — thinking models still work, they just spend turns thinking.
 * **Context window:** some models need more than your server's default — 8k+ recommended.
 
+Running many models against the same setup? Set `$LB_BASE_URL` once instead of repeating `--base-url` on every command — every CLI entry point (`run_eval.py`, `run_sandbox.py`, `run_oracle.py`, `doctor.py`) reads it, and an explicit `--base-url` always wins over the env var. If `--base-url` points at a gateway multiplexing several physical model hosts rather than a single one, see `--lock-host` in `python cli/run_eval.py --help` — it disambiguates the per-host VRAM run-lock (and gets recorded as `via_gateway` in the run's provenance) so concurrent runs on genuinely different hardware don't serialize against each other unnecessarily.
+
 No accounts, no API keys, no `.env` — Docker plus the model server you already run is the whole setup. No git or Python either: [QUICKSTART.md](QUICKSTART.md) walks the whole thing step by step, LM Studio included, with a fuller troubleshooting list.
 
 ## How it works

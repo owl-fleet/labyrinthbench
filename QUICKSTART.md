@@ -61,6 +61,8 @@ docker exec labyrinthbench python cli/run_eval.py --model qwen3:14b --base-url h
 
 Qwen3-family "thinking" models: add `--no-think` for comparable runs. (`--no-think` is Ollama-only — it uses Ollama's native API; on any other server, run without it.)
 
+Running many commands against the same server? Set `LB_BASE_URL` once (`export LB_BASE_URL=http://host.docker.internal:11434/v1`) instead of repeating `--base-url` everywhere — every CLI tool here reads it, and `--base-url` still wins if you pass both.
+
 ## Building from source instead
 
 If you'd rather build than pull (or want the code on disk): green **Code** button on the GitHub page → **Download ZIP** → extract it (e.g. `Documents\labyrinthbench`), then from a terminal in that folder:
