@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 
 import httpx
@@ -286,9 +287,15 @@ def main():
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--output", default="/results/results.jsonl")
     ap.add_argument("--label", default=None)
-    ap.add_argument("--lock-base-url", default="http://localhost:11434/v1",
+    ap.add_argument("--lock-base-url",
+                    default=os.environ.get("LB_LOCK_HOST") or os.environ.get("LB_BASE_URL", "http://localhost:11434/v1"),
                     help="GPU host the agent model runs on — used only for the eval lock/heartbeat "
-                         "(/eval-status visibility), not for any request.")
+                         "(/eval-status visibility), not for any request. Default: $LB_LOCK_HOST, "
+                         "else $LB_BASE_URL, else http://localhost:11434/v1 — this flag IS already "
+                         "the operator-supplied lock-key override run_eval.py's --lock-host adds "
+                         "elsewhere (see its module docstring 'Locking through a gateway'); name "
+                         "it as the physical host, not a gateway, or runs through a shared gateway "
+                         "will over-serialize against unrelated hardware.")
     ap.add_argument("--episode-timeout", type=float, default=600.0,
                     help="Max seconds between SSE chunks before the episode aborts.")
     ap.add_argument("--verbose", action="store_true")

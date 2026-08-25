@@ -7,7 +7,16 @@ Usage:
 
 Options:
   --model         Model name (passed in the messages body)
-  --base-url      OpenAI-compatible base URL (default: http://localhost:11434/v1)
+  --base-url      OpenAI-compatible base URL (default: $LB_BASE_URL, else
+                  http://localhost:11434/v1). Point this at any OpenAI-compatible
+                  endpoint — Ollama, LM Studio, llama.cpp, or a multi-model gateway
+                  fronting several of them. Set $LB_BASE_URL once in your environment
+                  instead of repeating --base-url on every invocation; the CLI flag
+                  always wins when both are given.
+  --lock-host     Operator-supplied override for the per-host VRAM run-lock key (see
+                  "Locking through a gateway" below). Default: $LB_LOCK_HOST, else the
+                  hostname parsed out of --base-url (correct when --base-url IS the
+                  physical host; wrong when it's a gateway multiplexing several).
   --maze-url      LabyrinthBench API URL (default: http://localhost:8090)
   --deg           DEG id to run (default: alpha-1)
   --runs          Number of independent sessions (default: 1)
@@ -31,6 +40,21 @@ Options:
                   supplied from `journalctl -u ollama | grep n_ctx_slot` (scripts/e1a-run-row.sh
                   has the SSH+grep recipe). NOT auto-detected: ollama's /v1 endpoint silently
                   drops --num-ctx (options), so the CLI flag can never be trusted as ground truth.
+
+Locking through a gateway:
+  The per-host VRAM lock (see _lock_path below) exists to stop two concurrent runs from
+  fighting over the SAME physical GPU's VRAM. It keys on --base-url's hostname, which is
+  correct when --base-url names one physical machine. It stops being correct once
+  --base-url names a multi-upstream gateway (several models, several physical hosts,
+  one hostname): every run through that gateway would then share ONE lock key regardless
+  of which hardware actually serves its model, serializing unrelated runs that don't
+  actually contend for the same VRAM. This is a conservative failure (extra
+  serialization, never silent corruption or a missed lock), and is exactly why
+  --lock-host exists as an explicit operator override — same pattern as --n-ctx-slot:
+  the CLI cannot discover ground truth here on its own, so it takes an operator's word
+  for it rather than guessing. Passing --lock-host also flips the `via_gateway` flag
+  stamped into this run's provenance (see provenance.capture()) — the run-record answers
+  "did this go through a gateway?" from data, not from memory.
 """
 from __future__ import annotations
 
@@ -72,13 +96,16 @@ _LLM_TIMEOUT_SECS = float(os.environ.get("LB_LLM_TIMEOUT", "1800"))
 _HEARTBEAT_STALE_SECS = 600  # lock is hung if heartbeat older than this
 
 
-def _lock_path(base_url: str) -> Path:
-    host = urlparse(base_url).hostname or "local"
+def _lock_path(base_url: str, lock_host: str | None = None) -> Path:
+    # lock_host is the operator's --lock-host/$LB_LOCK_HOST override — see the module
+    # docstring's "Locking through a gateway" section. None preserves the original
+    # behavior byte-for-byte: derive the key from --base-url's own hostname.
+    host = lock_host or (urlparse(base_url).hostname or "local")
     return Path(f"/results/.eval_lock_{host.replace('.', '_')}")
 
 
-def _acquire_lock(model, deg, runs, base_url):
-    lock = _lock_path(base_url)
+def _acquire_lock(model, deg, runs, base_url, lock_host: str | None = None):
+    lock = _lock_path(base_url, lock_host)
     if lock.exists():
         existing = json.loads(lock.read_text())
         try:
@@ -96,7 +123,7 @@ def _acquire_lock(model, deg, runs, base_url):
                 )
             else:
                 raise SystemExit(
-                    f"ERROR: eval already running on {urlparse(base_url).hostname} — "
+                    f"ERROR: eval already running on {lock_host or urlparse(base_url).hostname} — "
                     f"{existing['model']} on {existing['deg']}\n"
                     f"PID {existing['pid']}, started {existing['started']}, "
                     f"last heartbeat {last_hb}\n"
@@ -112,8 +139,8 @@ def _acquire_lock(model, deg, runs, base_url):
     }, indent=2))
 
 
-def _update_heartbeat(base_url: str) -> None:
-    lock = _lock_path(base_url)
+def _update_heartbeat(base_url: str, lock_host: str | None = None) -> None:
+    lock = _lock_path(base_url, lock_host)
     if not lock.exists():
         return
     try:
@@ -124,8 +151,8 @@ def _update_heartbeat(base_url: str) -> None:
         pass
 
 
-def _release_lock(base_url: str):
-    _lock_path(base_url).unlink(missing_ok=True)
+def _release_lock(base_url: str, lock_host: str | None = None):
+    _lock_path(base_url, lock_host).unlink(missing_ok=True)
 
 
 # Action mechanics — invariant across all DEGs. %-template (precedent: run_sandbox._SANDBOX_MECHANICS):
@@ -495,6 +522,7 @@ def run_session(
     policy_code_ref: str | None = None,
     n_ctx_slot: int | None = None,
     api_key: str | None = None,
+    lock_host: str | None = None,
 ) -> dict:
     if overlay_only:
         stateless = True  # overlay-only = wipe the model's context each turn; the HUD is the entire context
@@ -625,7 +653,7 @@ def run_session(
         else:
             call_messages = messages
         llm_json = _llm_call(llm, model, call_messages, options=options, think=False if no_think else None)
-        _update_heartbeat(base_url)
+        _update_heartbeat(base_url, lock_host)
         usage = llm_json.get("usage")
         choice = llm_json["choices"][0]
         msg = choice["message"]
@@ -953,7 +981,16 @@ def run_session(
 def main():
     ap = argparse.ArgumentParser(description="LabyrinthBench CLI harness")
     ap.add_argument("--model", required=True)
-    ap.add_argument("--base-url", default="http://localhost:11434/v1")
+    ap.add_argument("--base-url", default=os.environ.get("LB_BASE_URL", "http://localhost:11434/v1"),
+                    help="OpenAI-compatible endpoint (Ollama, LM Studio, llama.cpp, or a "
+                         "multi-model gateway). Default: $LB_BASE_URL, else "
+                         "http://localhost:11434/v1.")
+    ap.add_argument("--lock-host", default=os.environ.get("LB_LOCK_HOST") or None,
+                    help="Operator override for the VRAM run-lock key and the `via_gateway` "
+                         "provenance flag — set this to the PHYSICAL host name when --base-url "
+                         "points at a multi-upstream gateway (see module docstring 'Locking "
+                         "through a gateway'). Default: $LB_LOCK_HOST, else derived from "
+                         "--base-url's own hostname (correct only when --base-url IS the host).")
     ap.add_argument("--maze-url", default="http://localhost:8090")
     ap.add_argument("--deg", default="alpha-1")
     ap.add_argument("--runs", type=int, default=1)
@@ -1059,7 +1096,7 @@ def main():
     output_path = Path(args.output)
     results = []
 
-    _acquire_lock(args.model, args.deg, args.runs, args.base_url)
+    _acquire_lock(args.model, args.deg, args.runs, args.base_url, args.lock_host)
 
     # Serving-stack identity, captured ONCE per invocation and stamped onto every row below.
     # Once, not per session: the stack cannot change mid-invocation, and the probe is HTTP the
@@ -1070,6 +1107,11 @@ def main():
     except Exception as e:  # pragma: no cover — belt and braces; capture() already swallows
         prov = {"error": str(e)[:200]}
         print(f"  ! provenance capture failed (non-fatal): {e}")
+    # Audit column (confined-effector-gateway chunk 08): was this run's base_url a physical
+    # host, or something fronting several (a gateway)? Derived from --lock-host/$LB_LOCK_HOST
+    # rather than guessed — the operator is the one who knows, same as --n-ctx-slot.
+    prov["lock_host"] = args.lock_host
+    prov["via_gateway"] = bool(args.lock_host)
 
     try:
         for i in range(args.runs):
@@ -1107,6 +1149,7 @@ def main():
                     policy_code_ref=args.policy_code_ref,
                     n_ctx_slot=args.n_ctx_slot,
                     api_key=args.api_key,
+                    lock_host=args.lock_host,
                 )
             except Exception as e:
                 print(f"  ERROR: {e}")
@@ -1148,7 +1191,7 @@ def main():
                     file=sys.stderr,
                 )
     finally:
-        _release_lock(args.base_url)
+        _release_lock(args.base_url, args.lock_host)
 
     # Summary
     n = len(results)
