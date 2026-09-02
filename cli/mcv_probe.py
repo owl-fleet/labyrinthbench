@@ -5,13 +5,13 @@ Replays decision points minted by `run_eval.py --dump-context` against context-s
 variants and scores each fork's next-gate answer against DEG ground truth. No engine
 interaction: the corpus IS the state; ground truth is computed from the DEG yaml chain.
 
-Modes (plan: knowledge/projects/plans/marginal-context-value/):
+Modes (design of record: the marginal-context-value plan, private lab notebook):
   This script is MEASUREMENT mode at horizon 1 only. On-policy trajectories and
   optimization/beam mode are later chunks — do not bolt them on here.
 
 Usage (from the sandbox container):
   python cli/mcv_probe.py --corpus /results/mcv/corpus-r0.jsonl \
-      --deg degs/nav-3.yaml --base-url http://192.168.0.11:11434/v1 \
+      --deg degs/nav-3.yaml --base-url http://localhost:11434/v1 \
       --model qwen3:14b --output /results/mcv/probe-r0.jsonl [--strategies s0,s1,...]
 """
 import argparse
