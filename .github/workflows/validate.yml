@@ -34,3 +34,15 @@ jobs:
           args=""
           for e in entries/*.json; do args="$args --entry $e"; done
           python3 cli/verify.py $args
+
+  # Server-side twin of scripts/pre-push-scan.sh (the client-side pre-push hook): the pattern
+  # battery (operator identity, LAN topology, internal service names, credential shapes,
+  # private notebook paths) plus gitleaks via docker. Added 2026-09-02 after PR #2 landed a
+  # test file carrying real LAN addresses — the hook only guards pushes made from a checkout
+  # that has it installed; this job guards the repo. Fails the PR on any hit.
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pattern battery + gitleaks (scripts/pre-push-scan.sh)
+        run: bash scripts/pre-push-scan.sh
