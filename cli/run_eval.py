@@ -862,7 +862,8 @@ def run_session(
             # Combined turn_end (assistant + this turn's observation) — see the module docstring
             # on why one call replicates the two separate legacy append() sites exactly.
             policy.turn_end(context_policy.TurnSnapshot(
-                turn=turn, sys_prompt=sys_prompt, engine_text=engine_text, model_text=model_text))
+                turn=turn, sys_prompt=sys_prompt, engine_text=engine_text, model_text=model_text,
+                gate_id=act_data.get("gate_id")))   # engine's gate id for a gate commit; None otherwise
             turns_log.append({
                 "turn": turn, "model_text": model_text, "model_reasoning": model_reasoning,
                 "action_parsed": action, "engine_text": engine_text,

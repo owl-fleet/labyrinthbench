@@ -52,6 +52,8 @@ class TurnSnapshot:
     engine_text: str
     model_text: str = ""
     action: Optional[dict] = None
+    gate_id: Optional[str] = None   # the engine's gate id for THIS turn's gate commit (run_eval relays
+                                    # /act's `gate_id`; None for observes, moves, and older engines)
 
 
 @dataclass
@@ -214,10 +216,12 @@ class AccumulatePlusLedgerPolicy(AccumulatePolicy):
 
     Ledger-provenance rule: an entry is recorded only when the model's own commit was followed
     by the engine's `Gate answer: CORRECT` — anchored on the engine's verdict, never on the
-    model's self-report. The gate label is read off the observation the model was shown
-    (`[GATE <id>: ...]` on the committed path's line); when no fresh listing names that path the
-    label falls back to an ordinal (`#n`). Everything the ledger knows, the model already saw:
-    task-general.
+    model's self-report. The gate label is the engine's own gate id for the commit when the
+    harness relays it (`TurnSnapshot.gate_id`, from `/act`'s response — the same public label the
+    room listing shows and the same key `--show-recall` renders); otherwise it is read off the
+    observation the model was shown (`[GATE <id>: ...]` on the committed path's line), and only
+    when neither exists does it fall back to an ordinal (`#n`). Task-general: no answer-key
+    content enters the ledger, only the engine's verdict and the gate's public name.
     """
 
     name = "accumulate+ledger"
@@ -263,7 +267,12 @@ class AccumulatePlusLedgerPolicy(AccumulatePolicy):
         # field rather than on the literal action name.
         a = snap.action or _parse_action_text(snap.model_text)
         if a and "answer" in a and "Gate answer: CORRECT" in (snap.engine_text or ""):
-            label = self._gate_label_for(str(a.get("path_id", "")))
+            # Label precedence: engine-relayed gate id → id on the committed path's line of the
+            # newest listing the model saw → ordinal. The engine id closes the blind-commit hole
+            # (MCV rung ii, 2026-09-02: a model that committed at n1 without ever observing it had
+            # never been shown "c1b", so the listing search could only yield `#2=12` — a label a
+            # later "add N to your c1b answer" cannot be mapped onto; 3 of 6 trajectories).
+            label = snap.gate_id or self._gate_label_for(str(a.get("path_id", "")))
             self._ledger.append((label, str(a.get("answer", ""))))
         super().turn_end(snap)
 
@@ -620,6 +629,28 @@ def _smoke() -> int:
                              engine_text="--- OK ---\nGate answer: CORRECT\nLocation: n3\nGate 4.\n"))
     if al.ledger_line() != "recall = c1a=7 | c1b=12 | #3=18":
         fails.append(f"accumulate+ledger labelling (fresh listing / stale listing -> ordinal): {al.ledger_line()!r}")
+    # Engine-relayed gate id wins over the listing search — the blind-commit case: the model commits
+    # at a room it never observed, so no listing it saw names the gate (MCV rung ii `#2=12`).
+    # Precedence chain stays intact: relayed / relayed / absent -> ordinal.
+    al2 = make_policy("accumulate+ledger", "SYS")
+    al2.seed(obs0)
+    al2.turn_end(TurnSnapshot(turn=1, sys_prompt="SYS",
+                              model_text='{"action": "commit", "path_id": "forward", "answer": "7"}',
+                              engine_text=ok1, gate_id="c1a"))
+    al2.turn_end(TurnSnapshot(turn=2, sys_prompt="SYS",
+                              model_text='{"action": "commit", "path_id": "forward", "answer": "12"}',
+                              engine_text="--- OK ---\nGate answer: CORRECT\nLocation: n2\nGate 3.\n", gate_id="c1b"))
+    al2.turn_end(TurnSnapshot(turn=3, sys_prompt="SYS",
+                              model_text='{"action": "commit", "path_id": "forward", "answer": "18"}',
+                              engine_text="--- OK ---\nGate answer: CORRECT\nLocation: n3\nGate 4.\n"))
+    if al2.ledger_line() != "recall = c1a=7 | c1b=12 | #3=18":
+        fails.append(f"accumulate+ledger engine gate_id labelling (relayed / relayed blind / absent -> ordinal): {al2.ledger_line()!r}")
+    al2.turn_end(TurnSnapshot(turn=4, sys_prompt="SYS", model_text='{"action": "observe"}', engine_text=obs1, gate_id=None))
+    al2.turn_end(TurnSnapshot(turn=5, sys_prompt="SYS",
+                              model_text='{"action": "commit", "path_id": "forward", "answer": "9"}',
+                              engine_text=wrong, gate_id="c1b"))
+    if al2.ledger_line() != "recall = c1a=7 | c1b=12 | #3=18":
+        fails.append(f"accumulate+ledger recorded a non-CORRECT turn despite a relayed gate_id: {al2.ledger_line()!r}")
     telem = al.telemetry(TurnSnapshot(turn=6, sys_prompt="SYS", engine_text="x"), al.turn_start(TurnSnapshot(turn=6, sys_prompt="SYS", engine_text="x")))
     if telem.wipe_event or telem.injected_chars["facts"] != len(al.ledger_line()):
         fails.append(f"accumulate+ledger telemetry malformed: {telem}")

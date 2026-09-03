@@ -289,7 +289,8 @@ class Session:
                     "locked", self.current_node, self.steps_used, self.deg.step_budget,
                     "Gate answer: WRONG — the gate does not open.",
                 )
-                return {"ok": True, "outcome": "locked", "node_id": self.current_node_id, "text": text}
+                return {"ok": True, "outcome": "locked", "node_id": self.current_node_id, "text": text,
+                        "gate_id": gate_attempt.gate_id}
             else:
                 destination = path.gate.wrong_destination
                 gate_feedback = "Gate answer: WRONG."
@@ -385,7 +386,12 @@ class Session:
             gate_attempt=gate_attempt,
             outcome=outcome,
         ))
-        return {"ok": True, "outcome": outcome, "node_id": self.current_node_id, "text": text}
+        # gate_id: the engine's own public label for the gate this commit answered (None for an
+        # ungated move) — relayed by the harness into ContextPolicy.turn_end so a ledger policy
+        # labels a solve by the gate's name even when the model committed without observing the
+        # room (MCV rung ii, 2026-09-02: `#2=12` for c1b). Additive; older clients ignore it.
+        return {"ok": True, "outcome": outcome, "node_id": self.current_node_id, "text": text,
+                "gate_id": gate_attempt.gate_id if gate_attempt else None}
 
     def note_action(self, text: str) -> dict:
         trap = self._tick_dead_end()
