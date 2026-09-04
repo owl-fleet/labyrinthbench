@@ -144,6 +144,31 @@ class WipeCuratedPolicy(ContextPolicy):
         return {"wipe_events": self._wipes}
 
 
+class WipeCuratedNoRefreshPolicy(WipeCuratedPolicy):
+    """wipe-curated MINUS the harness's free observe-refresh (marginal-context-value chunk-04 arm
+    `s6_wipe_no_refresh`: the falsifier of "the wipe is what wins", taken from the wipe side).
+
+    Identical to `wipe-curated` in every respect but `needs_observe_refresh`, so run_eval.py's
+    shared refresh block does not fire and the two messages sent each turn are
+    [system, THIS turn's RAW /act response]. After a commit that response is bare: the CORRECT
+    path renders no overlay at all (engine/runner.py — outcome, verdict, location, room, steps)
+    and neither path renders a `Paths:` listing, so no gate problem reaches the model and it must
+    spend its own turn on `observe` exactly as the accumulate family does. The arm is therefore
+    "wipe-to-nothing" on the turns that matter, and is named for what it removes rather than for
+    what the overlay would have carried.
+
+    Coherent, not degenerate-by-construction: observe costs no step (Session.observe never
+    increments steps_used), nav-3 budgets 60 steps against 20 gates with the life budget as the
+    real constraint, and the harness turn cap is 3x the step budget — a two-turns-per-gate climb
+    to depth 20 fits with headroom, and --show-recall restores the recall block on every elective
+    observe. Task-general: it removes a mechanism, and a subtraction cannot add DEG knowledge.
+    """
+
+    name = "wipe-curated-norefresh"
+    generality_class = "task-general"
+    needs_observe_refresh = False
+
+
 class AccumulatePolicy(ContextPolicy):
     """Control arm (run_eval's default, no flags): the full conversation accumulates turn over
     turn, nothing ever wiped. Owns its own running message list — turn_end appends (assistant
@@ -290,6 +315,87 @@ class AccumulatePlusLedgerPolicy(AccumulatePolicy):
         d = super().task_end()
         d["ledger_entries"] = len(self._ledger)
         d["ledger_final"] = self.ledger_line()
+        return d
+
+
+class AccumulatePlusRefreshPolicy(AccumulatePolicy):
+    """accumulate PLUS the free observe-refresh the wipe arm gets (marginal-context-value chunk-04
+    arm `s5_accumulate_plus_refresh`: the falsifier of "the wipe is what wins", taken from the
+    accumulate side).
+
+    Declaring `needs_observe_refresh = True` is NECESSARY BUT NOT SUFFICIENT, and that is the whole
+    reason this class exists. run_eval.py's refresh block only reassigns `current_engine_text`,
+    which reaches a policy as the NEXT turn's TurnSnapshot.engine_text — and AccumulatePolicy's
+    turn_start returns its own running list and never reads that field. A bare flag flip would fire
+    a free engine observe whose text is discarded: an arm behaviourally identical to `accumulate`
+    plus a wasted HTTP call, yielding valid rows for an invalid cell. This class closes that hole by
+    CONSUMING the refresh in turn_start. `_smoke()` carries a regression asserting plain accumulate
+    still ignores the snapshot, so the reason this class exists cannot silently move.
+
+    Shape: the refreshed observation is APPENDED to the newest user message, never substituted for
+    it —
+
+        <this turn's raw /act response>      the CORRECT/WRONG verdict, kept
+        <blank line>
+        <the refreshed observation>          map, recall if enabled, Paths, gate problem
+
+    Append, not replace, is what makes this a ONE-VARIABLE edit against the `accumulate` control:
+    replacing would also delete the gate verdict, which is exactly the defect wipe-curated+actions
+    exists to patch (the wipe arm never sees its own WRONG), and would bundle two changes into the
+    arm built to unbundle two changes.
+
+    Like accumulate+ledger's recall line, the fold rides the SENT copy only: self._messages never
+    stores a refresh block, so every earlier turn stays byte-identical to plain accumulate and the
+    arm cannot drift into a context-volume manipulation. Task-general: the refresh is "ask the
+    engine for the current view" — no DEG structure, no answer-key content. It IS a budget subsidy,
+    which is why refresh_folds/refresh_chars_total make it a counted column rather than an
+    assumption.
+    """
+
+    name = "accumulate+refresh"
+    generality_class = "task-general"
+    needs_observe_refresh = True
+
+    def __init__(self, sys_prompt: str):
+        super().__init__(sys_prompt)
+        self._fold_chars = 0        # chars folded onto the newest user message THIS turn
+        self._folds = 0
+        self._fold_chars_total = 0
+
+    def turn_start(self, snap: TurnSnapshot) -> list:
+        msgs = list(self._messages)
+        fresh = snap.engine_text or ""
+        self._fold_chars = 0
+        # Text inequality is the exact — and only available — signal that the harness refreshed:
+        # run_eval never populates TurnSnapshot.action, so the dispatched action cannot be keyed
+        # off here (the same reason the ledger policy falls back to _parse_action_text). It is
+        # sound because all three non-refresh cases already compare equal: on turn 1 and after any
+        # elective observe/pull, snap.engine_text IS the newest stored message, and a failed
+        # refresh POST leaves current_engine_text unchanged.
+        if msgs and msgs[-1]["role"] == "user" and fresh and fresh != msgs[-1]["content"]:
+            msgs[-1] = {"role": "user", "content": msgs[-1]["content"] + "\n\n" + fresh}
+            self._fold_chars = len(fresh)
+            self._folds += 1
+            self._fold_chars_total += self._fold_chars
+        return msgs
+
+    def telemetry(self, snap: TurnSnapshot, call_messages: list) -> ContextTelemetry:
+        # Exact partition, never double-counted: this turn's marginal engine text arrived EITHER as
+        # the free refresh (overlay) or as the model's own elected observation (history).
+        return ContextTelemetry(
+            turn=snap.turn,
+            policy=self.name,
+            injected_chars={"overlay": self._fold_chars,
+                            "history": 0 if self._fold_chars else len(snap.engine_text),
+                            "facts": 0, "scratchpad": 0},
+            context_size_at_commit=sum(len(m["content"]) for m in call_messages),
+            wipe_event=False,
+        )
+
+    def task_end(self) -> dict:
+        d = super().task_end()
+        d["refresh_folds"] = self._folds
+        d["refresh_chars_total"] = self._fold_chars_total
         return d
 
 
@@ -465,8 +571,10 @@ POLICIES: dict = {
     cls.name: cls
     for cls in (
         WipeCuratedPolicy,
+        WipeCuratedNoRefreshPolicy,      # chunk-04 disambiguation: the wipe-side falsifier
         AccumulatePolicy,
         AccumulatePlusLedgerPolicy,
+        AccumulatePlusRefreshPolicy,     # chunk-04 disambiguation: the accumulate-side falsifier
         DropOldEnginePolicy,
         WipeEveryKPolicy,
         CompactPolicy,
@@ -658,6 +766,80 @@ def _smoke() -> int:
     if te.get("wipe_events") != 0 or te.get("ledger_entries") != 3:
         fails.append(f"accumulate+ledger task_end: {te}")
 
+    # accumulate+refresh (MCV chunk 04): plain accumulate history PLUS the harness's free
+    # observe-refresh, APPENDED to the newest user message. The trap covered here is the NULL ARM —
+    # needs_observe_refresh on its own changes nothing, because AccumulatePolicy.turn_start ignores
+    # snap.engine_text, so the FOLD (not the flag) is what makes this cell real.
+    ok_bare = "--- OK ---\nGate answer: CORRECT\nLocation: n1\nGate 2.\nSteps: 1 / 60"
+    fresh_obs = ("[MAP — fog of war: corridors shown ~2 hops out]\n  n1 (here): forward [gated] -> n2\n\n"
+                 "--- OBSERVE ---\nLocation: n1\n\nPaths:\n  forward: gate  [GATE c1b: Add 5 to your c1a answer]\n")
+    ar = make_policy("accumulate+refresh", "SYS")
+    if not ar.needs_observe_refresh:
+        fails.append("accumulate+refresh does not request the harness refresh")
+    ar.seed(obs0)
+    m = ar.turn_start(TurnSnapshot(turn=1, sys_prompt="SYS", engine_text=obs0))
+    if m != [{"role": "system", "content": "SYS"}, {"role": "user", "content": obs0}]:
+        fails.append(f"accumulate+refresh turn 1 should be plain accumulate (nothing to refresh): {m}")
+    ar.turn_end(TurnSnapshot(turn=1, sys_prompt="SYS",
+                             model_text='{"action": "commit", "path_id": "forward", "answer": "7"}',
+                             engine_text=ok_bare))
+    m = ar.turn_start(TurnSnapshot(turn=2, sys_prompt="SYS", engine_text=fresh_obs))
+    u = m[-1]["content"]
+    if len(m) != 4 or [x["role"] for x in m] != ["system", "user", "assistant", "user"]:
+        fails.append(f"accumulate+refresh turn 2 message shape drifted from accumulate: {[x['role'] for x in m]}")
+    if not u.startswith(ok_bare) or "--- OBSERVE ---" not in u or "[GATE c1b" not in u:
+        fails.append(f"accumulate+refresh turn 2 did not consume the refresh (NULL ARM): {u[:120]!r}")
+    if "Gate answer: CORRECT" not in u:
+        fails.append("accumulate+refresh dropped the gate verdict — the fold appends, it never replaces")
+    if ar._messages[-1]["content"] != ok_bare:
+        fails.append("accumulate+refresh wrote a refresh block into its stored history")
+    telem = ar.telemetry(TurnSnapshot(turn=2, sys_prompt="SYS", engine_text=fresh_obs), m)
+    if telem.wipe_event or telem.injected_chars["overlay"] != len(fresh_obs) or telem.injected_chars["history"] != 0:
+        fails.append(f"accumulate+refresh telemetry malformed on a refreshed turn: {telem}")
+    # An ELECTIVE observe is not a refresh: engine_text is already the newest message -> no fold.
+    ar.turn_end(TurnSnapshot(turn=2, sys_prompt="SYS", model_text='{"action": "observe"}', engine_text=obs1))
+    m = ar.turn_start(TurnSnapshot(turn=3, sys_prompt="SYS", engine_text=obs1))
+    if m[-1]["content"] != obs1:
+        fails.append(f"accumulate+refresh folded a turn the harness never refreshed: {m[-1]['content'][:80]!r}")
+    telem = ar.telemetry(TurnSnapshot(turn=3, sys_prompt="SYS", engine_text=obs1), m)
+    if telem.injected_chars["overlay"] != 0 or telem.injected_chars["history"] != len(obs1):
+        fails.append(f"accumulate+refresh mis-attributed an elective observe: {telem}")
+    te = ar.task_end()
+    if te.get("wipe_events") != 0 or te.get("refresh_folds") != 1 or te.get("refresh_chars_total") != len(fresh_obs):
+        fails.append(f"accumulate+refresh task_end: {te}")
+
+    # The null-arm premise, asserted directly: plain accumulate handed the SAME refreshed snapshot
+    # is UNCHANGED. This is why the flag alone is not an arm — if this check ever fails, the
+    # subclass's reason to exist has moved and the arm must be re-derived before it runs again.
+    ac2 = make_policy("accumulate", "SYS")
+    ac2.seed(obs0)
+    ac2.turn_end(TurnSnapshot(turn=1, sys_prompt="SYS", model_text="m1", engine_text=ok_bare))
+    if ac2.turn_start(TurnSnapshot(turn=2, sys_prompt="SYS", engine_text=fresh_obs))[-1]["content"] != ok_bare:
+        fails.append("accumulate consumed snap.engine_text — the null-arm premise moved")
+
+    # wipe-curated-norefresh (MCV chunk 04): byte-identical to wipe-curated except it declines the
+    # harness refresh, so what it sends is [system, THIS turn's RAW /act response] — after a commit,
+    # the bare commit result with no Paths listing and no gate problem.
+    wn = make_policy("wipe-curated-norefresh", "SYS")
+    if wn.needs_observe_refresh:
+        fails.append("wipe-curated-norefresh still requests the harness refresh")
+    m = wn.turn_start(TurnSnapshot(turn=1, sys_prompt="SYS", engine_text=obs0))
+    if m != [{"role": "system", "content": "SYS"}, {"role": "user", "content": obs0}]:
+        fails.append(f"wipe-curated-norefresh turn 1: {m}")
+    m = wn.turn_start(TurnSnapshot(turn=2, sys_prompt="SYS", engine_text=ok_bare))
+    if m != [{"role": "system", "content": "SYS"}, {"role": "user", "content": ok_bare}]:
+        fails.append(f"wipe-curated-norefresh turn 2 must send the RAW commit result verbatim: {m}")
+    if "Paths:" in m[1]["content"] or "[GATE" in m[1]["content"]:
+        fails.append("wipe-curated-norefresh fixture is not a bare commit result — the cell is mis-specified")
+    if wn.task_end() != {"wipe_events": 2}:
+        fails.append(f"wipe-curated-norefresh task_end: {wn.task_end()}")
+
+    # provenance: both chunk-04 arms declare task-general and auto-derive a builtin code_ref.
+    for _nm in ("accumulate+refresh", "wipe-curated-norefresh"):
+        _p = policy_provenance(_nm)
+        if _p["source"] != "builtin" or _p["generality_class"] != "task-general":
+            fails.append(f"{_nm} provenance malformed: {_p}")
+
     # drop-old-engine (MCV s2): full history kept, but what is SENT is
     # [system, every assistant reply, the CURRENT observation] — older engine turns withheld.
     de = make_policy("drop-old-engine", "SYS")
@@ -711,7 +893,8 @@ def _smoke() -> int:
             print(f"  ✗ {f}")
         return 1
     print("[context_policy smoke] PASS — wipe-curated/accumulate/wipe-curated+actions/accumulate+ledger/"
-          "drop-old-engine message construction verified, stubs refuse construction, the provenance gate holds.")
+          "drop-old-engine/accumulate+refresh/wipe-curated-norefresh message construction verified "
+          "(including the null-arm regression), stubs refuse construction, the provenance gate holds.")
     return 0
 
 
