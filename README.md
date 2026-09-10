@@ -91,7 +91,7 @@ The third family attacks the notes themselves. In `rev-2` (34 gates), eight vari
 |---|---|---|
 | `alpha` | branching maze — dead ends, a loop trap | navigation and recall together, the agent case |
 | `nav-3` | corridor, 20 gates | retention: every gate reaches back to a named earlier answer |
-| `rev-2` | corridor, 34 gates, values change mid-run | currency under interference: is the note current, or just familiar? |
+| `rev-2` | corridor, 34 gates, values change mid-run | currency under interference: is the note current, or just familiar? ([how the traps are built](docs/interference-explained.md)) |
 
 A map (a **DEG** — deterministic evaluation graph) is structure plus gate content; the mint (`engine/mint.py`) deals *instances* — same structure, different seeded values, byte-deterministic from the seed. The board can deal you an instance no one has seen and still re-derive your entire run from the trace.
 
@@ -172,6 +172,7 @@ The wiping policy I ship demonstrably doesn't win everywhere — two of nine coh
 | `cli/` | Evaluation harness (`run_eval.py`), analysis passes |
 | `api/` | Scoring API + the live `/watch` view |
 | `degs/` | Maze manifests |
+| `docs/interference-explained.md` | How the `rev-2` interference traps are built — and why a wrong answer names its own mechanism |
 | `results/e1a-table1/` | The headline cell: tables, figure, raw pass outputs |
 | `results/renderer-cell/` | The maze image above, sourced: `scripts/render_trace.py` was written by qwen3:14b — all three attempts, full transcripts, the automated checker |
 | `METHODOLOGY.md` | Board rules: lanes, integrity ladder, scoring, verification limits |
