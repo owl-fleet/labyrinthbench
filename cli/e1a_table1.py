@@ -166,7 +166,7 @@ def compute_unobserved_guesses(per_cell_valid, degs_dir):
                 gates, var_history = ladder_cache[deg]
                 counts = cf.classify_run(row, gates, var_history)
                 if isinstance(counts, dict):
-                    total += counts.get("unobserved-guess", 0)
+                    total += counts.get("classes", {}).get("unobserved-guess", 0)
             out[(safe, arm)] = total
         except Exception as exc:
             print(f"[mechanism] {safe}/{arm}: {exc}", file=sys.stderr)

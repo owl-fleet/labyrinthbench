@@ -6,11 +6,26 @@ The registered mechanism metric for the look-gate + cohort addendum
 both arms were UNOBSERVED GUESSES (a commit answering a gate at a node never observed
 since arrival, on gates whose answers are stated in the problem text).
 
-For each wrong commit in each run it classifies:
+For each wrong commit in each run it assigns ONE primary class, first match wins:
   unobserved-guess  — answered a gate at a node not observed since arrival
-  stale-value       — answer equals an EARLIER value of the asked variable (interference)
-  other-var-value   — answer equals the current value of a DIFFERENT variable
+  stale-answer      — answer equals this question's true answer at an EARLIER ask of it
+                      (a re-ask: same answer_fn over the same dependencies) — reusing
+                      your own earlier computed answer
+  stale-value       — interference: on a stated gate, the answer equals a superseded value
+                      of the variable it sets; on a derived gate, re-evaluating answer_fn
+                      with ONE depended-on variable at a superseded value reproduces it
+  other-var-value   — answer equals the current value of some variable, but is not the true
+                      answer (on a derived gate this includes answering one operand, or the
+                      untaken branch of a conditional)
   other-wrong       — observed, wrong, none of the above
+With --detail, every class a wrong commit matched is listed alongside the primary, so
+overlaps stay visible (a re-ask with one revision in between is both stale-answer and
+stale-value; stale-answer wins because the re-ask motif exists to provoke it).
+
+Asked variables come from the manifest — a gate's depends_on, else its sets_var — and
+answers are evaluated by the engine's own Gate.resolved_answer and compared with its own
+score_gate. Before 2026-09-12 they were parsed out of the problem prose, which silently
+disabled stale-value on every reasoning and synthesis gate.
 
 Reads the DEG yaml (for the ladder + variable timeline) and one-or-more results JSONL
 files; prints per-run rows and per-file aggregates. Read-only.
@@ -23,17 +38,32 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
+import sys
+from pathlib import Path
 
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from engine.gate_bank import score_gate  # noqa: E402
+from engine.graph import Gate  # noqa: E402
+
+CLASSES = ("unobserved-guess", "stale-answer", "stale-value", "other-var-value", "other-wrong")
+_UNRESOLVABLE = "__UNRESOLVABLE__"
+
+
+def _gate(g: dict) -> Gate:
+    return Gate(problem=g.get("problem", ""), answer=str(g.get("answer", "")),
+                gate_id=g.get("gate_id", "?"), problem_template=g.get("problem_template"),
+                answer_fn=g.get("answer_fn"), depends_on=g.get("depends_on"),
+                seed=g.get("seed") or {}, sets_var=g.get("sets_var"))
+
 
 def load_ladder(deg_id: str, degs_dir: str):
-    """Walk the DEG from start following gated paths → ordered [(gate_id, sets_var, answer, problem)]
-    and a per-variable value timeline."""
+    """Walk the DEG from start following gated paths → ordered [Gate] and a per-variable value
+    timeline {var: [(ladder_idx, value)]}, bound the way the engine binds its var_ledger."""
     deg = yaml.safe_load(open(os.path.join(degs_dir, f"{deg_id}.yaml")))
     node_by_id = {n["id"]: n for n in deg["nodes"]}
-    gates = []
+    gates: list[Gate] = []
     cur = deg["nodes"][0]["id"]
     seen = set()
     while cur and cur not in seen:
@@ -44,41 +74,82 @@ def load_ladder(deg_id: str, degs_dir: str):
         nxt = None
         for p in node.get("paths", []):
             if p.get("gate"):
-                g = p["gate"]
-                gates.append((g.get("gate_id", "?"), g.get("sets_var") or "",
-                              str(g.get("answer", "")), g.get("problem", "")))
+                gates.append(_gate(p["gate"]))
                 nxt = p.get("destination")
                 break
         cur = nxt
     var_history: dict[str, list[tuple[int, str]]] = {}
-    for i, (gid, sets, ans, prob) in enumerate(gates):
-        if sets:
-            m = re.search(r"(?:initialized to|is now)\s+(-?\d+)", prob)
-            var_history.setdefault(sets, []).append((i, m.group(1) if m else ans))
+    ledger: dict[str, str] = {}
+    results: dict[str, str] = {}
+    for i, g in enumerate(gates):
+        ans = _resolve(g, results, ledger)
+        results[g.gate_id] = ans
+        if g.sets_var:
+            ledger[g.sets_var] = ans
+            var_history.setdefault(g.sets_var, []).append((i, ans))
     return gates, var_history
 
 
-def asked_var(prob: str):
-    m = re.search(r"value of ([A-H])\b", prob)
-    return m.group(1) if m else None
+def _resolve(gate: Gate, gate_results: dict, ledger: dict) -> str:
+    try:
+        return gate.resolved_answer(gate_results, ledger)
+    except Exception:
+        return _UNRESOLVABLE
+
+
+def asked_vars(gate: Gate) -> list[str]:
+    return gate.dep_ids or ([gate.sets_var] if gate.sets_var else [])
 
 
 def classify_run(row: dict, gates, var_history):
-    def vals_before(var, gi):
-        return [v for i, v in var_history.get(var, []) if i < gi]
+    def hist(var, gi):
+        # A gate that sets a variable states its new value, so the binding is current AT that gate.
+        return [v for i, v in var_history.get(var, []) if i <= gi]
 
-    def current_values_at(gi):
-        out = {}
-        for var, hist in var_history.items():
-            vs = [v for i, v in hist if i < gi]
-            if vs:
-                out[var] = vs[-1]
+    def ledger_at(gi):
+        return {var: h[-1] for var in var_history if (h := hist(var, gi))}
+
+    def superseded(var, gi):
+        h = hist(var, gi)
+        return list(dict.fromkeys(v for v in h[:-1] if v != h[-1])) if h else []
+
+    def results_before(gi):
+        out, ledger = {}, {}
+        for j, g in enumerate(gates[:gi]):
+            out[g.gate_id] = _resolve(g, out, ledger)
+            if g.sets_var:
+                ledger[g.sets_var] = out[g.gate_id]
         return out
+
+    def matches(gi, given):
+        gate = gates[gi]
+        ledger, results = ledger_at(gi), results_before(gi)
+        true = _resolve(gate, results, ledger)
+
+        def hit(cand):
+            return cand not in (None, _UNRESOLVABLE) and cand != true and score_gate(given, cand)
+
+        found = []
+        if gate.answer_fn and any(
+                g.answer_fn == gate.answer_fn and g.dep_ids == gate.dep_ids
+                and hit(_resolve(g, results_before(j), ledger_at(j)))
+                for j, g in enumerate(gates[:gi])):
+            found.append("stale-answer")
+        if gate.answer_fn:
+            swapped = [v for v in gate.dep_ids if v in var_history and any(
+                hit(_resolve(gate, results, {**ledger, v: x})) for x in superseded(v, gi))]
+            if swapped:
+                found.append(f"stale-value[{','.join(swapped)}]")
+        elif gate.sets_var and any(hit(x) for x in superseded(gate.sets_var, gi)):
+            found.append(f"stale-value[{gate.sets_var}]")
+        if any(hit(val) for val in ledger.values()):
+            found.append("other-var-value")
+        return found
 
     gate_idx = 0
     observed_here = True  # control/look-gate both bootstrap an observe
     classes: dict[str, int] = {}
-    wrongs: list[tuple[int, str, str, str]] = []  # (1-based ladder pos, gate_id, class, given)
+    wrongs: list[tuple] = []  # (1-based ladder pos, gate_id, primary class, given, all matched)
     observes = commits = 0
     for t in row.get("turns_log", []):
         ap = t.get("action_parsed") or {}
@@ -89,20 +160,15 @@ def classify_run(row: dict, gates, var_history):
             observed_here = True
         elif act == "commit" and str(ap.get("answer") or "").strip():
             commits += 1
-            gid, sets, true_ans, prob = gates[gate_idx] if gate_idx < len(gates) else ("?", "", "?", "")
             given = str(ap.get("answer", ""))
             if "WRONG" in etext:
-                v = asked_var(prob) or sets
+                gid = gates[gate_idx].gate_id if gate_idx < len(gates) else "?"
+                found = matches(gate_idx, given) if gate_idx < len(gates) else []
                 if not observed_here:
-                    k = "unobserved-guess"
-                elif v and given in vals_before(v, gate_idx)[:-1]:
-                    k = "stale-value"
-                elif given in [val for kv, val in current_values_at(gate_idx).items() if kv != v]:
-                    k = "other-var-value"
-                else:
-                    k = "other-wrong"
+                    found = ["unobserved-guess"] + found
+                k = found[0].split("[")[0] if found else "other-wrong"
                 classes[k] = classes.get(k, 0) + 1
-                wrongs.append((gate_idx + 1, gid, k, given))
+                wrongs.append((gate_idx + 1, gid, k, given, found))
             elif "CORRECT" in etext:
                 gate_idx += 1
                 observed_here = False
@@ -121,7 +187,12 @@ def main():
     args = ap.parse_args()
 
     gates, var_history = load_ladder(args.deg, args.degs_dir)
-    print(f"DEG {args.deg}: {len(gates)} gates; init ladder = read-and-echo through the first sets_var run\n")
+    blind = [g.gate_id for g in gates if not asked_vars(g)]
+    print(f"DEG {args.deg}: {len(gates)} gates; init ladder = read-and-echo through the first sets_var run")
+    if blind:
+        print(f"  {len(blind)} gate(s) ask no variable — only unobserved-guess / other-wrong can fire there: "
+              f"{', '.join(blind)}")
+    print()
     grand: dict[str, int] = {}
     tot_obs = tot_cmt = 0
     for path in args.files:
@@ -142,8 +213,9 @@ def main():
             print(f"  depth={r.get('ramp_depth'):>2}  obs/cmt={st['observes']}/{st['commits']}"
                   f"  wrong={st['classes']}{lg_s}")
             if args.detail:
-                for pos, gid, k, given in st["wrongs"]:
-                    print(f"      gate {pos:>2} ({gid}): {k}  given={given}")
+                for pos, gid, k, given, found in st["wrongs"]:
+                    also_s = f"  also={','.join(found[1:])}" if len(found) > 1 else ""
+                    print(f"      gate {pos:>2} ({gid}): {found[0] if found else k}  given={given}{also_s}")
         print(f"  FILE: obs/commit={fobs/max(fcmt,1):.2f}  wrong-classes={fclasses}\n")
         tot_obs += fobs; tot_cmt += fcmt
         for k, v in fclasses.items():
