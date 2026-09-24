@@ -442,8 +442,19 @@ def main():
         fh.write(md)
     with open(os.path.join(args.out_dir, "e1a_table1.json"), "w") as fh:
         json.dump(table, fh, indent=2, default=str)
-    render_stripplot(table, os.path.join(args.out_dir, "e1a_table1_stripplot.png"),
-                     control_only=args.control_only, paired_only=not args.stripplot_all)
+    # The plot is optional: without numpy/matplotlib the tables above still stand, so warn
+    # and exit 0 rather than fail after they were written. Any other ImportError still raises.
+    wrote_png = True
+    try:
+        render_stripplot(table, os.path.join(args.out_dir, "e1a_table1_stripplot.png"),
+                         control_only=args.control_only, paired_only=not args.stripplot_all)
+    except ImportError as e:
+        missing = (e.name or "").split(".")[0]
+        if missing not in ("matplotlib", "numpy"):
+            raise
+        wrote_png = False
+        print(f"warning: {missing} not installed — skipped e1a_table1_stripplot.png "
+              f"(tables written)", file=sys.stderr)
 
     # stdout summary for validation
     print(f"models: {len([s for s in table])}")
@@ -460,7 +471,7 @@ def main():
         print(f"  {safe:42s} c_med={_fmt(ct['control_median']):>4} "
               f"w_med={_fmt(ct['wiped_median']):>4} Δ={_fmt(ct['delta_wiped_minus_control']):>5} "
               f"{'FALSIFIER✓' if ct['meets_falsifier'] else '':10} {flag}")
-    print(f"\nwrote e1a_table1.{{md,json,png}} to {args.out_dir}")
+    print(f"\nwrote e1a_table1.{{md,json{',png' if wrote_png else ''}}} to {args.out_dir}")
 
 
 if __name__ == "__main__":
