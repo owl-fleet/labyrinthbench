@@ -68,4 +68,10 @@ Full dependencies for the API and harness: `pip install -r requirements.txt` (pl
 
 ## Cloud sessions
 
-When `CLAUDE_CODE_REMOTE` is `true` you are on a hosted VM with a fresh clone: Python, docker and `gh` are present, PyPI and ghcr.io are reachable, and there is no model server and no GPU. Scope is code, tests, docs and the site. Every rule above applies unchanged, and the scan runs fine there (gitleaks pulls via docker).
+When `CLAUDE_CODE_REMOTE` is `true` you are on a hosted VM with a fresh clone. Measured on the first session (2026-09-24):
+
+- Python is **3.11**, while CI pins **3.12**. Don't rely on 3.12-only syntax or stdlib additions.
+- `gh`, `pip` and PyPI work. There is no model server and no GPU, so scope is code, tests, docs and the site.
+- The docker CLI is installed but **dockerd is not running**, so `scripts/pre-push-scan.sh` skips gitleaks and still reports PASS on the pattern battery alone. That is a weaker pass than the local one. Either start the daemon first (`nohup dockerd >/tmp/dockerd.log 2>&1 &`, then wait for `/var/run/docker.sock`) and rerun the scan, or say in the PR body that gitleaks did not run locally. CI's `scan` job runs gitleaks on the PR regardless.
+
+Every rule above applies unchanged.
