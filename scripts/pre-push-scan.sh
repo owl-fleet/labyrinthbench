@@ -23,11 +23,26 @@
 #   This script can also be run standalone (`bash scripts/pre-push-scan.sh`)
 #   from anywhere inside the tree for a manual check.
 #
+# USAGE
+#   scripts/pre-push-scan.sh [--require-gitleaks]
+#
+#   --require-gitleaks   Treat gitleaks as mandatory: if docker isn't usable
+#                         or the gitleaks image/container can't run, that is
+#                         an ERROR (exit 2), not a warned-and-skipped PASS.
+#                         Without it, docker being unavailable is unchanged:
+#                         a loud warning, gitleaks skipped, no failure.
+#
 # EXIT STATUS
-#   0  — clean: no category had hits after allowlist filtering, gitleaks
-#        (if run) found nothing.
-#   1+ — dirty: at least one category had hits, or gitleaks failed, or
-#        gitleaks was requested but errored out (not merely "unavailable").
+#   0 — clean: no category had hits after allowlist filtering, and gitleaks
+#       (if it ran) found nothing.
+#   1 — dirty: at least one category had hits, or gitleaks ran and found a
+#       real leak (gitleaks exit 1). This is a verdict, never a tooling
+#       failure.
+#   2 — errored: gitleaks could not be run to a verdict at all — the image
+#       couldn't be pulled, the container couldn't start, gitleaks itself
+#       exited with something other than 0/1, or (with --require-gitleaks)
+#       docker wasn't usable in the first place. No leak verdict was
+#       reached, so this is never conflated with exit 1.
 #
 # DESIGN NOTES
 #   - Never prints a matched secret VALUE, anywhere, for any category —
@@ -45,6 +60,20 @@
 #     any other tracked file instead of being carved out as an exception.
 
 set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Args.
+# ---------------------------------------------------------------------------
+REQUIRE_GITLEAKS=0
+for arg in "$@"; do
+    case "$arg" in
+        --require-gitleaks) REQUIRE_GITLEAKS=1 ;;
+        *)
+            echo "pre-push-scan: unknown argument: $arg" >&2
+            exit 2
+            ;;
+    esac
+done
 
 # ---------------------------------------------------------------------------
 # Locate repo root. Prefer git (tracked-file semantics); fall back to the
@@ -200,21 +229,57 @@ for cat in "${CATEGORY_ORDER[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Gitleaks pass. Optional dependency: run it if docker is available, warn
-# loudly (but don't fail) if it isn't.
+# Gitleaks pass. Optional dependency by default: run it if docker is usable,
+# warn loudly (but don't fail) if it isn't — unless --require-gitleaks was
+# given, in which case docker being unusable is an ERROR, not a skip.
+#
+# A non-zero exit from `docker run` is NOT automatically "leaks detected":
+# docker itself fails with 125/126/127 when it can't even start the
+# container, and gitleaks can exit with codes other than 0 (clean) or 1
+# (leaks found) on its own internal errors. Only exit 1 from the gitleaks
+# container is a real finding; everything else that keeps us from reaching
+# a verdict is ERROR (exit 2), never FAIL (exit 1) — a tooling failure is
+# not a leak accusation.
 # ---------------------------------------------------------------------------
 echo
 echo "== gitleaks =="
 GITLEAKS_STATUS="skipped"
+GITLEAKS_IMAGE="ghcr.io/gitleaks/gitleaks:latest"
+
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    if docker run --rm -v "$PWD:/scan" ghcr.io/gitleaks/gitleaks:latest dir /scan --no-banner --exit-code 1; then
-        GITLEAKS_STATUS="PASS"
-        echo "[PASS] gitleaks — no leaks found"
-    else
-        GITLEAKS_STATUS="FAIL"
-        OVERALL_FAIL=1
-        echo "[FAIL] gitleaks — leaks detected (see output above)"
+    if ! docker image inspect "$GITLEAKS_IMAGE" >/dev/null 2>&1; then
+        docker pull "$GITLEAKS_IMAGE" >/dev/null 2>&1
+        PULL_STATUS=$?
+        if [[ "$PULL_STATUS" -ne 0 ]]; then
+            GITLEAKS_STATUS="ERROR"
+            echo "[ERROR] gitleaks — could not run (image pull failed, docker exit $PULL_STATUS)"
+        fi
     fi
+
+    if [[ "$GITLEAKS_STATUS" != "ERROR" ]]; then
+        docker run --rm -v "$PWD:/scan" "$GITLEAKS_IMAGE" dir /scan --no-banner --exit-code 1
+        RUN_STATUS=$?
+        if [[ "$RUN_STATUS" -eq 0 ]]; then
+            GITLEAKS_STATUS="PASS"
+            echo "[PASS] gitleaks — no leaks found"
+        elif [[ "$RUN_STATUS" -eq 1 ]]; then
+            GITLEAKS_STATUS="FAIL"
+            OVERALL_FAIL=1
+            echo "[FAIL] gitleaks — leaks detected (see output above)"
+        else
+            case "$RUN_STATUS" in
+                125) cause="docker could not start the container" ;;
+                126) cause="container command not executable" ;;
+                127) cause="container command not found" ;;
+                *)   cause="gitleaks exited $RUN_STATUS" ;;
+            esac
+            GITLEAKS_STATUS="ERROR"
+            echo "[ERROR] gitleaks — could not run ($cause, docker exit $RUN_STATUS)"
+        fi
+    fi
+elif [[ "$REQUIRE_GITLEAKS" -eq 1 ]]; then
+    GITLEAKS_STATUS="ERROR"
+    echo "[ERROR] gitleaks required but unavailable"
 else
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
     echo "!! WARNING: docker not available — gitleaks scan SKIPPED.            !!"
@@ -224,10 +289,15 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Verdict.
+# Verdict. ERROR (gitleaks never reached a verdict) is checked first so it
+# can never be reported as exit 1 — a tooling failure is not a leak finding.
 # ---------------------------------------------------------------------------
 echo
 echo "== gitleaks: $GITLEAKS_STATUS =="
+if [[ "$GITLEAKS_STATUS" == "ERROR" ]]; then
+    echo "== VERDICT: ERROR — gitleaks did not reach a verdict; see above. =="
+    exit 2
+fi
 if [[ "$OVERALL_FAIL" -ne 0 ]]; then
     echo "== VERDICT: FAIL — do not push. Review hits above. =="
     exit 1
