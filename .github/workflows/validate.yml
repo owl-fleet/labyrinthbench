@@ -35,6 +35,30 @@ jobs:
           for e in entries/*.json; do args="$args --entry $e"; done
           python3 cli/verify.py $args
 
+  # The cli/test_*.py scripts are plain scripts (PASS/FAIL lines, exit 1 on any failure),
+  # historically hand-run. Added to CI 2026-09-25 with the LB cloud lane: hosted sessions
+  # author on Python 3.11 while the image and the validate job pin 3.12, so both are run.
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -r requirements.txt numpy matplotlib   # the e1a test exercises the real plot path
+      - name: cli/test_*.py — every script exits 0
+        run: |
+          rc=0
+          for t in cli/test_*.py; do
+            echo "== $t"
+            python3 "$t" || rc=1
+          done
+          exit $rc
+
   # Server-side twin of scripts/pre-push-scan.sh (the client-side pre-push hook): the pattern
   # battery (operator identity, LAN topology, internal service names, credential shapes,
   # private notebook paths) plus gitleaks via docker. Added 2026-09-02 after PR #2 landed a
