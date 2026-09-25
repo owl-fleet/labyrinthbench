@@ -172,8 +172,12 @@ with tempfile.TemporaryDirectory(prefix="lb-pre-push-scan-test-") as tmp_root:
           "leaks detected" not in p.stdout)
 
     # --- design note: a real pattern-battery hit never echoes the matched value ---
+    # Built by concatenation, not a contiguous literal, so THIS source file doesn't
+    # itself trip the repo's own api-key-shapes pattern when pre-push-scan.sh scans
+    # the tree (the same reason the target script bracket-tricks its own patterns).
+    fake_secret = "sk-" + "abcdefghijklmnopqrstuvwx"
     secret_file = workdir / "config.txt"
-    secret_file.write_text("token = sk-abcdefghijklmnopqrstuvwx\n")
+    secret_file.write_text(f"token = {fake_secret}\n")
     p = run_scan(workdir, extra_path_dir=fake_bin, env_overrides={
         "FAKE_DOCKER_INFO_EXIT": "0",
         "FAKE_DOCKER_INSPECT_EXIT": "0",
@@ -182,7 +186,7 @@ with tempfile.TemporaryDirectory(prefix="lb-pre-push-scan-test-") as tmp_root:
     secret_file.unlink()
     check("pattern-battery hit -> category reported", "api-key-shapes" in p.stdout)
     check("pattern-battery hit -> matched secret value never printed",
-          "sk-abcdefghijklmnopqrstuvwx" not in p.stdout)
+          fake_secret not in p.stdout)
     check("pattern-battery hit alone (gitleaks clean) -> exit 1", p.returncode == 1)
 
 print(f"\n{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
