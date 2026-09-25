@@ -66,9 +66,20 @@ Full dependencies for the API and harness: `pip install -r requirements.txt` (pl
 - New tests follow the existing `cli/test_*.py` shape: a docstring that says what it proves and "no live server", stubbed transport, `sys.exit(1 if FAILS else 0)`.
 - One change per PR. Say in the PR body which of the commands above you ran and their results.
 
+## Task briefs
+
+Work handed to a session arrives as a GitHub issue in this repo labelled `cloud` (Goal / Where / Acceptance / Constraints / Out of scope / Report). The issue is the whole brief: there is no other context, and nothing outside the repo is reachable. Read it with `gh issue view <n> --comments` before touching anything.
+
+- Branch `claude/issue-<n>-<short-slug>`; implement exactly the brief's scope.
+- Run the brief's acceptance commands, then the CI commands above, then the scan.
+- The PR body starts with `Closes #<n>`, lists every command run with its exit status and result, states whether gitleaks ran, and covers the brief's Report section.
+- If the brief is ambiguous or an acceptance command cannot pass after a real attempt, still push and open the PR as a draft with a `## Blocked` section naming exactly what is missing. An unpushed result is lost when a hosted VM ends.
+
+`.claude/settings.json` in this repo denies the commands the Rules forbid (pushing main, force-pushes, tags, merges, `git add -A`); it applies to local and hosted sessions alike.
+
 ## Cloud sessions
 
-When `CLAUDE_CODE_REMOTE` is `true` you are on a hosted VM with a fresh clone. Measured on the first session (2026-09-24):
+When `CLAUDE_CODE_REMOTE` is `true` (the documented marker is `CLAUDE_CODE_REMOTE_SESSION_ID`, set to the session id) you are on a hosted VM with a fresh clone. Measured on the first session (2026-09-24):
 
 - Python is **3.11**, while CI pins **3.12**. Don't rely on 3.12-only syntax or stdlib additions.
 - `gh`, `pip` and PyPI work. There is no model server and no GPU, so scope is code, tests, docs and the site.
