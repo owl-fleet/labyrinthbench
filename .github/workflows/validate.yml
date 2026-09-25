@@ -50,6 +50,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -r requirements.txt numpy matplotlib   # the e1a test exercises the real plot path
+      # test_lock_path.py creates the harness's lock dir, /results, at import; the runner user
+      # cannot create a directory under / (the image and the hosted VM run as root and can).
+      - run: sudo mkdir -p /results && sudo chown "$USER" /results
       - name: cli/test_*.py — every script exits 0
         run: |
           rc=0
