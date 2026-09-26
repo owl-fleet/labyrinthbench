@@ -60,15 +60,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import random
 import re
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+
+# point-and-click chunk 01 (forced-choice arm): the engine package is a sibling of cli/, not a
+# dependency of it today — this is the first cli/*.py file to import from engine/ for anything
+# beyond run_oracle.py's already-established pattern (BFS solver reads the DEG directly). Needed
+# so the forced-choice harness can build a commit menu's candidate answers locally (the HTTP API
+# never exposes a gate's answer — see api/main.py's ActRequest/render_observe — by design).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from engine.distractors import NONE_OF_THESE, generate_distractors  # noqa: E402
+from engine.graph import DEG, load_deg  # noqa: E402
 
 # Cross-run memory faculty for the LB Design 2 accumulation eval. Importable whether run as
 # `python cli/run_eval.py` (sibling on sys.path[0]) or `python -m cli.run_eval` (package).
@@ -240,6 +251,296 @@ def build_system_prompt(briefing: str = "", pull_state: bool = False, state_labe
     if state_label == "verified":
         framing = f"{VERIFIED_DISCLOSURE}\n\n{framing}"
     return f"{mech}\n\n{framing}\n\n{_JSON_TAIL}\n"
+
+
+# ── Forced-choice arm (point-and-click chunk 01) ──────────────────────────────────────────────
+# Response mode is an axis ORTHOGONAL to context-policy (accumulate/wipe-curated): generative
+# free-generates a JSON action; forced-choice never generates an action at all — the harness
+# enumerates every legal action (plus, for a gated path, the correct answer and its deterministic
+# distractors from engine/distractors.py) as a labeled menu, and the model's ENTIRE contribution
+# is a single-token label pick, scored by argmax over that label's logprobs (or, when the upstream
+# doesn't expose logprobs, by constrained GBNF-grammar decoding to the label alphabet — see
+# _llm_call's `grammar` param and --fc-selection below). This is the "recognition, not recall"
+# axis, not the context-management axis: forced-choice runs under EITHER context policy unchanged
+# (see run_session's response_mode branch, which only replaces how THIS turn's `action` dict is
+# decided — call_messages construction, dispatch, scoring, and turns_log/score_data plumbing are
+# fully shared with generative mode).
+
+# Label-set rotation (label-token bias control — chunk 01 Design/Controls): rotated by run_index,
+# not by a flag, so an operator running --runs N already gets N different label sets for free.
+FC_LABEL_SETS: list[list[str]] = [
+    ["A", "B", "C", "D", "E", "F", "G", "H"],
+    ["P", "Q", "R", "S", "T", "U", "V", "W"],
+    ["1", "2", "3", "4", "5", "6", "7", "8"],
+]
+
+_FC_JSON_TAIL = (
+    'Respond with ONLY the single label character of your choice (e.g. "C"). '
+    "No JSON, no punctuation, no explanation — just the one character."
+)
+
+
+def build_forced_choice_system_prompt(briefing: str = "") -> str:
+    """Forced-choice's own system prompt. The objective/rules framing carries over, but the
+    JSON-action instructions (SYSTEM_MECHANICS / _JSON_TAIL) do not apply — there is no JSON to
+    emit, only a menu label. Kept as a SEPARATE builder (not a branch inside build_system_prompt)
+    so generative mode's prompt construction is provably untouched by this arm's existence."""
+    framing = briefing.strip() if briefing.strip() else DEFAULT_STRATEGY
+    mech = (
+        "Your objective: reach EXIT. That is the only goal.\n\n"
+        "Each node has paths forward. Paths are open (free to take) or gated (solve a problem to "
+        "proceed).\n\n"
+        "Every turn you are shown a MENU of labeled options: the legal actions here, and — for a "
+        "gated path — the candidate answers to its problem. Pick exactly ONE label.\n\n"
+        "Rules:\n"
+        "- Exhaust your step budget without reaching EXIT = failure.\n"
+        '- If none of the candidate answers looks right, the menu always includes a "none of '
+        'these" option rather than forcing a guess among them.'
+    )
+    return f"{mech}\n\n{framing}\n\n{_FC_JSON_TAIL}\n"
+
+
+@dataclass
+class _FCState:
+    """Forced-choice's local mirror of engine state — loaded from the SAME degs/*.yaml the API
+    server reads, tracked in lockstep with it turn by turn. Needed because a commit menu's
+    candidate VALUES require the gate object plus the resolved values of its dependencies, and
+    the HTTP API never exposes an answer (by design — api/main.py's ActRequest/render_observe show
+    a gate's PROBLEM, never its answer). nav-3's gates are all LOCKS (wrong_destination=None), so
+    a wrong pick never moves the real session and this mirror cannot diverge from it by
+    construction: the model can only ever be AT node k once gates 1..k-1 were genuinely passed,
+    which is exactly what advances this mirror too. Kept updated by the turn loop itself (see
+    run_session's forced-choice branch and its post-dispatch mirror update)."""
+    deg: DEG
+    current_node_id: str
+    gate_results: dict = field(default_factory=dict)
+    var_ledger: dict = field(default_factory=dict)
+    traversal_stack: list = field(default_factory=list)
+
+
+@dataclass
+class _FCOption:
+    action: dict                       # {"action":..., "path_id":..., "answer":...} — ready to dispatch
+    gate_id: str | None = None         # the gate this option answers (None for observe/back/open-move)
+    is_correct: bool | None = None     # True/False for a candidate-answer option; None otherwise
+
+
+@dataclass
+class _FCMenu:
+    labels: list        # ordered, already-shuffled label tokens, e.g. ["C", "A", "E", ...]
+    options: dict        # label -> _FCOption
+
+
+def _fc_build_menu(state: _FCState, rng: "random.Random", label_set: list,
+                    max_distractors: int = 3) -> _FCMenu:
+    """Build this turn's flat forced-choice menu: {observe} + {one option per path — for a gated
+    path, one option PER CANDIDATE (the correct answer, its deterministic distractors, and a
+    'none of these' that always dispatches as a genuine wrong commit, matching generative mode's
+    failure semantics)} + {back, when the mirror's traversal stack is non-empty}. Position bias
+    (Controls) is handled by shuffling BEFORE label assignment; `rng` is caller-owned so the
+    caller controls its seed/lifetime across the whole run."""
+    node = state.deg.node(state.current_node_id)
+    opts: list[_FCOption] = [_FCOption(action={"action": "observe", "path_id": "", "answer": ""})]
+    for path in node.paths:
+        if path.is_gated:
+            expected = path.gate.resolved_answer(state.gate_results, state.var_ledger)
+            if expected == "__UNRESOLVABLE__":
+                # A dependency hasn't been passed yet — unreachable on nav-3's strictly ordered
+                # lock chain (this path cannot be live before its deps are satisfied), but degrade
+                # to a single always-wrong placeholder rather than crash a live campaign row.
+                opts.append(_FCOption(
+                    action={"action": "commit", "path_id": path.id, "answer": NONE_OF_THESE},
+                    gate_id=path.gate.gate_id, is_correct=False))
+                continue
+            distractors = generate_distractors(path.gate, expected, state.gate_results,
+                                                state.var_ledger, n=max_distractors)
+            for cand in [expected] + distractors:
+                opts.append(_FCOption(
+                    action={"action": "commit", "path_id": path.id, "answer": cand},
+                    gate_id=path.gate.gate_id, is_correct=(cand == expected)))
+            opts.append(_FCOption(
+                action={"action": "commit", "path_id": path.id, "answer": NONE_OF_THESE},
+                gate_id=path.gate.gate_id, is_correct=False))
+        else:
+            opts.append(_FCOption(action={"action": "commit", "path_id": path.id, "answer": ""}))
+    if state.traversal_stack:
+        opts.append(_FCOption(action={"action": "commit", "path_id": "back", "answer": ""}))
+    rng.shuffle(opts)
+    if len(opts) <= len(label_set):
+        labels = list(label_set[:len(opts)])
+    else:  # pragma: no cover — nav-3 never approaches this (observe + 1 gate's [correct + N
+        # distractors + none] + back is well under any label set's length); degrade to reusing
+        # the label set cyclically rather than silently dropping options.
+        labels = [label_set[i % len(label_set)] for i in range(len(opts))]
+    return _FCMenu(labels=labels, options=dict(zip(labels, opts)))
+
+
+def _fc_render_menu(menu: _FCMenu) -> str:
+    lines = ["", "--- CHOOSE ONE ---"]
+    for label in menu.labels:
+        act = menu.options[label].action
+        if act["action"] == "observe":
+            desc = "observe (look around; free, no step cost)"
+        elif act.get("path_id") == "back":
+            desc = "go back to your previous location (costs one step)"
+        elif act["action"] == "commit" and act.get("answer") == NONE_OF_THESE:
+            desc = f"path {act['path_id']!r}: none of the candidate answers is correct"
+        elif act["action"] == "commit" and act.get("answer"):
+            desc = f"path {act['path_id']!r}: answer = {act['answer']}"
+        else:
+            desc = f"path {act['path_id']!r}: take this open path"
+        lines.append(f"  {label}) {desc}")
+    lines.append("Respond with exactly one label character.")
+    return "\n".join(lines)
+
+
+def _fc_append_menu(call_messages: list, menu_text: str) -> list:
+    """Return a NEW messages list with the menu appended to the final message (always a user
+    turn, in every context-policy/legacy branch) — never mutates the caller's list in place,
+    since accumulate-family policies own their message list as long-lived state."""
+    out = [dict(m) for m in call_messages]
+    if out and out[-1].get("role") == "user":
+        out[-1] = {**out[-1], "content": out[-1]["content"] + "\n" + menu_text}
+    else:  # pragma: no cover — defensive; every branch ends in a user turn today
+        out.append({"role": "user", "content": menu_text})
+    return out
+
+
+def _fc_build_grammar(labels: list) -> str:
+    """Minimal GBNF root rule restricting output to exactly one of `labels` — the constrained-
+    decode fallback for an upstream that doesn't expose logprobs (chunk 01's own Preflight step
+    determines, live, which path a given upstream needs; see --fc-selection)."""
+    alts = " | ".join(f'"{l}"' for l in labels)
+    return f"root ::= ({alts})\n"
+
+
+def _fc_extract_label_probs(llm_json: dict, labels: list) -> dict | None:
+    """Best-effort extraction of a per-label probability vector from an OpenAI-compatible chat-
+    completions response's `logprobs.content[0].top_logprobs` — llama.cpp's documented shape for
+    `/v1/chat/completions`, UNPROBED LIVE as of this authoring (chunk 01's Preflight step 1 is
+    exactly this probe, run before the design is frozen). Returns None (never raises) on any
+    shape mismatch, so the caller can tell "the upstream didn't give us logprobs this call" from
+    "the model answered" and fall back cleanly. Reads the FIRST generated token only — the
+    single-token, zero-reasoning read this whole arm is built on (temperature 0, no-think)."""
+    try:
+        choice = llm_json["choices"][0]
+        lp = choice.get("logprobs")
+        if not lp or not lp.get("content"):
+            return None
+        first = lp["content"][0]
+        alts = first.get("top_logprobs") or []
+        raw: dict[str, float] = {}
+        for a in alts:
+            tok = (a.get("token") or "").strip().upper()
+            lg = a.get("logprob")
+            if tok in labels and lg is not None and (tok not in raw or lg > raw[tok]):
+                raw[tok] = lg
+        if not raw:
+            # Some servers report only the sampled token's own logprob, with no alternatives list.
+            tok = (first.get("token") or "").strip().upper()
+            lg = first.get("logprob")
+            if tok in labels and lg is not None:
+                raw[tok] = lg
+        if not raw:
+            return None
+        # Renormalize over JUST the label set (softmax over these logprobs) — a label missing
+        # from top_logprobs (truncated by the server's top-N) gets a probability FLOOR rather
+        # than 0, so a margin/ECE computation never divides by a degenerate vector.
+        floor = min(raw.values()) - 10.0
+        full = {l: raw.get(l, floor) for l in labels}
+        m = max(full.values())
+        exps = {l: math.exp(v - m) for l, v in full.items()}
+        z = sum(exps.values())
+        return {l: v / z for l, v in exps.items()}
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _fc_score_turn(llm_json: dict, menu: _FCMenu, selection: str) -> dict:
+    """Decode this turn's model response into one menu option, by the requested `selection`
+    method ('logprobs' argmax, or 'grammar' — a direct read of the grammar-constrained output
+    text). Falls back logprobs -> raw-text parse -> the menu's first label (never crashes a
+    campaign row), with the fallback always visible in `selection_method` for later analysis
+    (F3: is scoring mode itself unusable on this model?)."""
+    prob_vec = None
+    method = selection
+    if selection == "logprobs":
+        prob_vec = _fc_extract_label_probs(llm_json, menu.labels)
+        if prob_vec is None:
+            method = "logprobs-unavailable-text-fallback"
+    if prob_vec is not None:
+        label = max(prob_vec, key=prob_vec.get)
+    else:
+        text = (llm_json["choices"][0]["message"].get("content") or "").strip().upper()
+        label = next((l for l in menu.labels if text.startswith(l)), None)
+        if label is None:
+            label = menu.labels[0]
+            method = method + "-undecodable-default"
+    sorted_probs = sorted(prob_vec.values(), reverse=True) if prob_vec else None
+    margin = (sorted_probs[0] - sorted_probs[1]) if sorted_probs and len(sorted_probs) > 1 else None
+    return {
+        "label": label,
+        "option": menu.options[label],
+        "probability_vector": prob_vec,
+        "top1_margin": margin,
+        "option_count": len(menu.labels),
+        "selection_method": method,
+    }
+
+
+def _fc_expected_calibration_error(records: list, n_bins: int = 10) -> float | None:
+    """Standard binned ECE over forced-choice ANSWER decisions only — `records` is a list of
+    (top1_confidence, was_correct) pairs, populated only for turns where the model's pick was a
+    candidate-answer option (observe/back/none-of-these have no top-1-confidence-vs-correctness
+    pair in the same sense). None when no such decisions were recorded (e.g. a grammar-only run
+    with no probability vectors, or a session that never reached a gate)."""
+    if not records:
+        return None
+    bins: list[list[tuple[float, bool]]] = [[] for _ in range(n_bins)]
+    for conf, correct in records:
+        idx = min(int(conf * n_bins), n_bins - 1)
+        bins[idx].append((conf, correct))
+    total = len(records)
+    ece = 0.0
+    for b in bins:
+        if not b:
+            continue
+        avg_conf = sum(c for c, _ in b) / len(b)
+        avg_acc = sum(1 for _, ok in b if ok) / len(b)
+        ece += (len(b) / total) * abs(avg_conf - avg_acc)
+    return ece
+
+
+def _fc_apply_dispatch(state: _FCState, action: dict, act_data: dict) -> None:
+    """Advance the local DEG mirror to match what the real engine just did, using act_data
+    (node_id / outcome / gate_id) as authoritative ground truth rather than re-deriving anything
+    — the mirror exists only to know what candidates/menu to offer NEXT turn, never to second-
+    guess the engine's own scoring. Mirrors engine/runner.py's Session.commit() state machine."""
+    if action.get("action") != "commit":
+        return  # observe/note/pull never move the node or touch gate_results
+    outcome = act_data.get("outcome")
+    if action.get("path_id") == "back":
+        if state.traversal_stack:
+            state.traversal_stack.pop()
+        if act_data.get("node_id"):
+            state.current_node_id = act_data["node_id"]
+        return
+    if outcome in ("locked", "out_of_lives"):
+        return  # wrong answer on a LOCK gate — stays put, mirror unchanged
+    # A move happened (a correct answer, or — not present on nav-3 — a routing gate's
+    # wrong_destination move): record the gate result (when this path was gated and passed) and
+    # follow the engine to its authoritative new node_id.
+    gate_id = act_data.get("gate_id")
+    if gate_id and outcome != "wrong":
+        prev_node = state.deg.node(state.current_node_id)
+        path = prev_node.get_path(action.get("path_id"))
+        if path is not None and path.is_gated:
+            state.gate_results[gate_id] = action.get("answer")
+            if path.gate.sets_var:
+                state.var_ledger[path.gate.sets_var] = action.get("answer")
+    state.traversal_stack.append(state.current_node_id)
+    if act_data.get("node_id"):
+        state.current_node_id = act_data["node_id"]
 
 
 def _parse_available_paths(text: str) -> list[str]:
@@ -417,7 +718,9 @@ def _native_usage(native_json: dict) -> dict | None:
     }
 
 
-def _llm_call(llm: httpx.Client, model: str, messages: list, retries: int = 3, options: dict | None = None, think: bool | None = None) -> dict:
+def _llm_call(llm: httpx.Client, model: str, messages: list, retries: int = 3, options: dict | None = None, think: bool | None = None,
+               max_tokens: int | None = None, logprobs: bool = False, top_logprobs: int | None = None,
+               grammar: str | None = None) -> dict:
     """Call the model with retry. When `think` is set we MUST use Ollama's NATIVE /api/chat endpoint:
     the OpenAI-compat /v1/chat/completions SILENTLY IGNORES a top-level `think` field, so `think:false`
     there does NOT suppress reasoning (verified on qwen3:14b — reasoning_len ~600 via /v1 vs 0 via
@@ -441,7 +744,15 @@ def _llm_call(llm: httpx.Client, model: str, messages: list, retries: int = 3, o
     recorded the whole run_session() as a bare {"error": ...} row with no depth/turns, losing
     everything the trajectory had already done. A SECOND consecutive 500 is re-raised (recorded as
     an error row by the caller) rather than retried again — a repeat 500 is a real server-side
-    failure, not a transient blip."""
+    failure, not a transient blip.
+
+    point-and-click chunk 01 (forced-choice arm): `max_tokens`/`logprobs`/`top_logprobs`/`grammar`
+    are purely ADDITIVE OpenAI-compatible (or, for `grammar`, llama.cpp-specific) request fields,
+    only inserted into the /chat/completions payload when truthy/non-None — every existing call
+    site (which passes none of them) sends the BYTE-IDENTICAL payload it always has (see
+    cli/test_response_mode_generative_unchanged.py). They are never sent on the native /api/chat
+    path (`think is not None`): that path is Ollama-only, and forced-choice mode always calls with
+    `think=None` (llama.cpp has no /api/chat to fall through from in the first place)."""
     last_exc = None
     http_500_retried = False
     _base = str(llm.base_url).rstrip("/")
@@ -481,6 +792,14 @@ def _llm_call(llm: httpx.Client, model: str, messages: list, retries: int = 3, o
             payload = {"model": model, "messages": messages, "stream": False}
             if options:
                 payload["options"] = options
+            if max_tokens is not None:
+                payload["max_tokens"] = max_tokens
+            if logprobs:
+                payload["logprobs"] = True
+            if top_logprobs is not None:
+                payload["top_logprobs"] = top_logprobs
+            if grammar is not None:
+                payload["grammar"] = grammar
             r = llm.post("/chat/completions", json=payload)
             r.raise_for_status()
             return r.json()
@@ -559,6 +878,11 @@ def run_session(
     api_key: str | None = None,
     lock_host: str | None = None,
     dump_context: str | None = None,
+    response_mode: str = "generative",
+    fc_max_distractors: int = 3,
+    fc_top_logprobs: int = 20,
+    fc_selection: str = "logprobs",
+    fc_degs_dir: str | None = None,
 ) -> dict:
     if overlay_only:
         stateless = True  # overlay-only = wipe the model's context each turn; the HUD is the entire context
@@ -598,8 +922,28 @@ def run_session(
     # arm, unchanged), and --observe-cap enables it standalone (recommended/none arms) so termination
     # is identical across all three observe-policies.
     observe_cap = observe_cap or look_gate
-    sys_prompt = ("/no_think\n\n" if no_think else "") + build_system_prompt(
-        briefing, pull_state=pull_state, state_label=state_label, recommend_observe=recommend_observe)
+    sys_prompt = ("/no_think\n\n" if no_think else "") + (
+        build_forced_choice_system_prompt(briefing) if response_mode == "forced-choice"
+        else build_system_prompt(briefing, pull_state=pull_state, state_label=state_label,
+                                  recommend_observe=recommend_observe)
+    )
+
+    # point-and-click chunk 01: the local DEG mirror (see _FCState's docstring for why the harness
+    # needs its own copy of gate/answer structure — the HTTP API never exposes an answer).
+    fc_state: _FCState | None = None
+    fc_rng: random.Random | None = None
+    fc_label_set: list | None = None
+    fc_argmax_fixpoint_count = 0
+    fc_prev_dispatch_key = None
+    fc_confidence_records: list[tuple[float, bool]] = []
+    if response_mode == "forced-choice":
+        _fc_degs_dir = Path(fc_degs_dir) if fc_degs_dir else Path(__file__).resolve().parent.parent / "degs"
+        fc_deg_obj = load_deg(_fc_degs_dir / f"{deg_id}.yaml")
+        fc_state = _FCState(deg=fc_deg_obj, current_node_id=fc_deg_obj.start_node_id)
+        # Seeded from this session's own id (logged on every row) — fully reproducible on demand,
+        # yet naturally varies run to run without needing a separate --fc-seed flag.
+        fc_rng = random.Random(session_id)
+        fc_label_set = FC_LABEL_SETS[run_index % len(FC_LABEL_SETS)]
 
     # ── Cross-run memory faculty (LB Design 2) — RETRIEVAL HOOK ───────────────────
     # Inject this arm's notes from past runs into the SYSTEM PROMPT (cross-run context is
@@ -688,7 +1032,18 @@ def run_session(
             ]
         else:
             call_messages = messages
-        llm_json = _llm_call(llm, model, call_messages, options=options, think=False if no_think else None)
+
+        fc_menu = None
+        if response_mode == "forced-choice":
+            fc_menu = _fc_build_menu(fc_state, fc_rng, fc_label_set, max_distractors=fc_max_distractors)
+            call_messages = _fc_append_menu(call_messages, _fc_render_menu(fc_menu))
+            fc_grammar = _fc_build_grammar(fc_menu.labels) if fc_selection == "grammar" else None
+            llm_json = _llm_call(llm, model, call_messages, options=options, think=None,
+                                  max_tokens=4, logprobs=(fc_selection == "logprobs"),
+                                  top_logprobs=fc_top_logprobs if fc_selection == "logprobs" else None,
+                                  grammar=fc_grammar)
+        else:
+            llm_json = _llm_call(llm, model, call_messages, options=options, think=False if no_think else None)
         _update_heartbeat(base_url, lock_host)
         usage = llm_json.get("usage")
         choice = llm_json["choices"][0]
@@ -715,6 +1070,37 @@ def run_session(
         if not model_text:
             model_text = model_reasoning
 
+        fc_scored = None
+        fc_row_fields = {
+            "probability_vector": None, "top1_margin": None, "option_count": None,
+            "selection_method": None, "argmax_fixpoint": None,
+        }
+        if response_mode == "forced-choice":
+            fc_scored = _fc_score_turn(llm_json, fc_menu, fc_selection)
+            action = dict(fc_scored["option"].action)
+            fc_dispatch_key = (fc_state.current_node_id, action.get("action"),
+                               action.get("path_id"), action.get("answer"))
+            fc_argmax_fixpoint = (fc_prev_dispatch_key is not None and fc_dispatch_key == fc_prev_dispatch_key)
+            if fc_argmax_fixpoint:
+                fc_argmax_fixpoint_count += 1
+                print(f"  [turn {turn}] ARGMAX-FIXPOINT: identical pick on identical state "
+                      f"(node={fc_state.current_node_id!r}) — logged, not intervened on")
+            fc_prev_dispatch_key = fc_dispatch_key
+            if fc_scored["option"].is_correct is not None and fc_scored["probability_vector"]:
+                fc_confidence_records.append(
+                    (max(fc_scored["probability_vector"].values()), bool(fc_scored["option"].is_correct)))
+            fc_row_fields = {
+                "probability_vector": fc_scored["probability_vector"],
+                "top1_margin": fc_scored["top1_margin"],
+                "option_count": fc_scored["option_count"],
+                "selection_method": fc_scored["selection_method"],
+                "argmax_fixpoint": fc_argmax_fixpoint,
+            }
+            if verbose:
+                print(f"  [turn {turn}] fc-menu options={fc_scored['option_count']} "
+                      f"label={fc_scored['label']!r} method={fc_scored['selection_method']} "
+                      f"margin={fc_scored['top1_margin']}")
+
         if dump_context:
             # MCV corpus sidecar: the exact context sent this turn, snapshotted BEFORE the
             # engine advances, so a fork can replay this decision point verbatim.
@@ -731,52 +1117,53 @@ def run_session(
         if policy is None and not stateless:
             messages.append({"role": "assistant", "content": model_text})
 
-        # Parse action
-        action = _parse_action(model_text)
-        if action is None:
-            print(f"  [turn {turn}] WARNING: could not parse JSON from model response — injecting observe")
-            action = {"action": "observe"}
-        else:
-            # Semantic normalizer — map common hallucinated action names to valid ones.
-            # High-confidence remaps preserve intent; last-resort falls back to observe.
-            MOVE_SYNONYMS    = {"move", "go", "navigate", "walk", "travel", "proceed", "take", "enter"}
-            INSPECT_SYNONYMS = {"check_gate", "examine", "inspect_gate", "look_at", "inspect_path", "check_path", "check", "inspect"}
-            OBSERVE_SYNONYMS = {"look", "survey", "scan", "view"}
-            BACK_SYNONYMS    = {"retreat", "backtrack", "go_back", "return_to", "back_up"}
-            NOTE_SYNONYMS    = {"remember", "record", "memo", "memorize"}
-            PULL_SYNONYMS    = {"pull_state", "get_state", "read_state", "fetch_state", "query_state",
-                                "request_state", "state", "ledger", "get_values", "get_variables", "check_state"}
-            # pull only valid when the arm enables it — otherwise it falls to the observe fallback as today
-            VALID_ACTIONS    = {"observe", "commit", "note"} | ({"pull"} if pull_state else set())
+        if response_mode != "forced-choice":
+            # Parse action
+            action = _parse_action(model_text)
+            if action is None:
+                print(f"  [turn {turn}] WARNING: could not parse JSON from model response — injecting observe")
+                action = {"action": "observe"}
+            else:
+                # Semantic normalizer — map common hallucinated action names to valid ones.
+                # High-confidence remaps preserve intent; last-resort falls back to observe.
+                MOVE_SYNONYMS    = {"move", "go", "navigate", "walk", "travel", "proceed", "take", "enter"}
+                INSPECT_SYNONYMS = {"check_gate", "examine", "inspect_gate", "look_at", "inspect_path", "check_path", "check", "inspect"}
+                OBSERVE_SYNONYMS = {"look", "survey", "scan", "view"}
+                BACK_SYNONYMS    = {"retreat", "backtrack", "go_back", "return_to", "back_up"}
+                NOTE_SYNONYMS    = {"remember", "record", "memo", "memorize"}
+                PULL_SYNONYMS    = {"pull_state", "get_state", "read_state", "fetch_state", "query_state",
+                                    "request_state", "state", "ledger", "get_values", "get_variables", "check_state"}
+                # pull only valid when the arm enables it — otherwise it falls to the observe fallback as today
+                VALID_ACTIONS    = {"observe", "commit", "note"} | ({"pull"} if pull_state else set())
 
-            act = action.get("action")
-            if act in MOVE_SYNONYMS:
-                path = (action.get("direction") or action.get("path") or
-                        action.get("to") or action.get("destination") or
-                        action.get("path_id") or "")
-                action = {"action": "commit", "path_id": path, "answer": action.get("answer", "")}
-                norm_action_count += 1
-            elif act in INSPECT_SYNONYMS:
-                # inspect is gone — fold into observe so model gets the gate info it wants
-                action = {"action": "observe"}
-                norm_action_count += 1
-            elif act in OBSERVE_SYNONYMS:
-                action = {"action": "observe"}
-                norm_action_count += 1
-            elif act in BACK_SYNONYMS:
-                action = {"action": "commit", "path_id": "back"}
-                norm_action_count += 1
-            elif act in NOTE_SYNONYMS:
-                text = action.get("text") or action.get("content") or action.get("note") or ""
-                action = {"action": "note", "text": text}
-                norm_action_count += 1
-            elif pull_state and act in PULL_SYNONYMS:
-                action = {"action": "pull"}
-                norm_action_count += 1
-            elif act not in VALID_ACTIONS:
-                print(f"  [turn {turn}] WARNING: unrecognized action {act!r} — injecting observe")
-                action = {"action": "observe"}
-                norm_action_count += 1
+                act = action.get("action")
+                if act in MOVE_SYNONYMS:
+                    path = (action.get("direction") or action.get("path") or
+                            action.get("to") or action.get("destination") or
+                            action.get("path_id") or "")
+                    action = {"action": "commit", "path_id": path, "answer": action.get("answer", "")}
+                    norm_action_count += 1
+                elif act in INSPECT_SYNONYMS:
+                    # inspect is gone — fold into observe so model gets the gate info it wants
+                    action = {"action": "observe"}
+                    norm_action_count += 1
+                elif act in OBSERVE_SYNONYMS:
+                    action = {"action": "observe"}
+                    norm_action_count += 1
+                elif act in BACK_SYNONYMS:
+                    action = {"action": "commit", "path_id": "back"}
+                    norm_action_count += 1
+                elif act in NOTE_SYNONYMS:
+                    text = action.get("text") or action.get("content") or action.get("note") or ""
+                    action = {"action": "note", "text": text}
+                    norm_action_count += 1
+                elif pull_state and act in PULL_SYNONYMS:
+                    action = {"action": "pull"}
+                    norm_action_count += 1
+                elif act not in VALID_ACTIONS:
+                    print(f"  [turn {turn}] WARNING: unrecognized action {act!r} — injecting observe")
+                    action = {"action": "observe"}
+                    norm_action_count += 1
 
         # Remap numeric path_id (e.g. "1", "2") to the actual path label from the last observe.
         # Models sometimes confuse gate option numbers with path labels.
@@ -844,6 +1231,7 @@ def run_session(
                     "action_parsed": action, "engine_text": f"[400→observe] {fallback_text}",
                     "usage": usage,
                     "context_telemetry": _asdict_or_none(turn_telem),
+                    **fc_row_fields,
                 })
                 current_engine_text = fallback_text
                 observed_here = True  # the fallback dispatched an observe
@@ -854,6 +1242,8 @@ def run_session(
                 continue
             raise
         act_data = act_resp.json()
+        if response_mode == "forced-choice":
+            _fc_apply_dispatch(fc_state, action, act_data)
 
         # Track observation state for the look-gate: an observe/pull reveals the current node;
         # a commit moves (or bounces) us to a node we must re-observe before answering its gate.
@@ -904,16 +1294,17 @@ def run_session(
                 "action_parsed": action, "engine_text": engine_text,
                 "usage": usage, "context_telemetry": _asdict_or_none(turn_telem),
                 "truncated": truncated,
+                **fc_row_fields,
             })
         elif stateless:
-            turns_log.append({"turn": turn, "model_text": model_text, "model_reasoning": model_reasoning, "action_parsed": action, "engine_text": engine_text, "injected_history": None, "truncated": truncated})
+            turns_log.append({"turn": turn, "model_text": model_text, "model_reasoning": model_reasoning, "action_parsed": action, "engine_text": engine_text, "injected_history": None, "truncated": truncated, **fc_row_fields})
         else:
             history_block = _build_history_block(decision_history) if inject_history else ""
             if kos_prompt:
                 user_content = _build_kos_state_block(kos_state) + engine_text
             else:
                 user_content = engine_text + history_block
-            turns_log.append({"turn": turn, "model_text": model_text, "model_reasoning": model_reasoning, "action_parsed": action, "engine_text": engine_text, "injected_history": history_block or None, "truncated": truncated})
+            turns_log.append({"turn": turn, "model_text": model_text, "model_reasoning": model_reasoning, "action_parsed": action, "engine_text": engine_text, "injected_history": history_block or None, "truncated": truncated, **fc_row_fields})
             messages.append({"role": "user", "content": user_content})
         completed = act_data.get("completed", False)
 
@@ -980,6 +1371,42 @@ def run_session(
     # instrument artifacts, not model decisions. A row with truncated_turns > 0 must not be read
     # as a clean measurement of the arm (2026-08-22).
     score_data["truncated_turns"] = truncated_turns
+
+    # point-and-click chunk 01 (forced-choice arm) — additive, None outside this response_mode so
+    # a generative row's schema is unchanged.
+    score_data["response_mode"] = response_mode
+    if response_mode == "forced-choice":
+        score_data["fc_selection"] = fc_selection
+        score_data["fc_max_distractors"] = fc_max_distractors
+        score_data["fc_label_set"] = fc_label_set
+        score_data["fc_argmax_fixpoint_count"] = fc_argmax_fixpoint_count
+        score_data["fc_ece"] = _fc_expected_calibration_error(fc_confidence_records)
+        score_data["fc_confidence_n"] = len(fc_confidence_records)
+        # Belt-and-braces cross-check: the local mirror must agree with the engine's own
+        # authoritative state at session end (_FCState's docstring: it never SHOULD diverge on
+        # nav-3's lock-only chain). A mismatch here means a real bug, not a modeling choice —
+        # surface it loudly rather than silently trust the mirror.
+        try:
+            _fc_state_resp = client.get(f"/session/{session_id}/state")
+            if _fc_state_resp.status_code == 200:
+                _engine_gr = _fc_state_resp.json().get("gate_results", {})
+                score_data["fc_mirror_mismatch"] = (_engine_gr != fc_state.gate_results)
+                if score_data["fc_mirror_mismatch"]:
+                    print(f"  !!! FC MIRROR MISMATCH: local gate_results {fc_state.gate_results!r} "
+                          f"!= engine gate_results {_engine_gr!r} — investigate before trusting "
+                          f"this row's menus", file=sys.stderr)
+        except Exception as e:
+            print(f"  ! fc mirror cross-check failed (non-fatal): {e}")
+            score_data["fc_mirror_mismatch"] = None
+    else:
+        score_data["fc_selection"] = None
+        score_data["fc_max_distractors"] = None
+        score_data["fc_label_set"] = None
+        score_data["fc_argmax_fixpoint_count"] = None
+        score_data["fc_ece"] = None
+        score_data["fc_confidence_n"] = None
+        score_data["fc_mirror_mismatch"] = None
+
     score_data["turns_log"] = turns_log
 
     # Provenance columns (lb-post-release chunk 02 — the standing gate): base_url is always
@@ -1166,6 +1593,37 @@ def main():
                          "--base-url (e.g. for key-authed cloud/gateway endpoints). Local Ollama/"
                          "LM Studio ignore it. Defaults to $LB_LLM_API_KEY; never logged or "
                          "persisted into --output/--db-url.")
+    # ── Forced-choice arm (point-and-click chunk 01) ──────────────────────────────
+    ap.add_argument("--response-mode", choices=["generative", "forced-choice"], default="generative",
+                    help="generative (default, unchanged behavior): the model free-generates a "
+                         "JSON action. forced-choice: the harness enumerates every legal action "
+                         "(plus, for a gated path, the correct answer and its deterministic "
+                         "distractors) as a labeled menu; the model's entire contribution is one "
+                         "label pick, scored by logprobs (or a constrained grammar — see "
+                         "--fc-selection). Orthogonal to --context-policy: pair with "
+                         "accumulate/wipe-curated for the chunk 01 2x2.")
+    ap.add_argument("--fc-selection", choices=["logprobs", "grammar"], default="logprobs",
+                    help="How a forced-choice turn is decoded. 'logprobs' (default) reads the "
+                         "argmax over the label alphabet's logprobs on the first generated token "
+                         "— needs an upstream that returns OpenAI-shaped logprobs/top_logprobs on "
+                         "/v1/chat/completions (chunk 01's Preflight step probes this live; not "
+                         "auto-detected, same operator-supplied-ground-truth pattern as "
+                         "--n-ctx-slot/--lock-host). 'grammar' constrains decoding to the label "
+                         "alphabet via a GBNF grammar (llama.cpp-specific request field) and reads "
+                         "the output text directly — the fallback for an upstream that can't do "
+                         "the former.")
+    ap.add_argument("--fc-max-distractors", type=int, default=3,
+                    help="Distractor count per gated-path candidate menu (engine/distractors.py), "
+                         "before the correct answer and 'none of these' are added. Frozen at 3 "
+                         "for chunk 01's pre-registration; exposed as a flag for the smoke cell.")
+    ap.add_argument("--fc-top-logprobs", type=int, default=20,
+                    help="top_logprobs requested per call when --fc-selection logprobs (OpenAI "
+                         "chat-completions field, 0-20). Menu size (observe + 1 gate's candidates "
+                         "+ back) stays well under this on nav-3.")
+    ap.add_argument("--fc-degs-dir", default=None,
+                    help="Directory of DEG yaml files for forced-choice's local engine mirror "
+                         "(engine/distractors.py needs the Gate object directly — the HTTP API "
+                         "never exposes an answer). Default: the repo's own degs/ next to cli/.")
     args = ap.parse_args()
 
     if (args.state_stub or args.state_label) and not args.pull_state:
@@ -1240,6 +1698,11 @@ def main():
                     api_key=args.api_key,
                     lock_host=args.lock_host,
                     dump_context=args.dump_context,
+                    response_mode=args.response_mode,
+                    fc_max_distractors=args.fc_max_distractors,
+                    fc_top_logprobs=args.fc_top_logprobs,
+                    fc_selection=args.fc_selection,
+                    fc_degs_dir=args.fc_degs_dir,
                 )
             except Exception as e:
                 print(f"  ERROR: {e}")
