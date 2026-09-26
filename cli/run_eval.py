@@ -823,6 +823,7 @@ def run_session(
         # WRONG. Placed before the path_id remap and the look-gate check so both see the final,
         # already-overridden action (harmless no-ops on an observe). Consumed once per turn
         # regardless of whether it fires — see _apply_force_observe's docstring.
+        _forced = False
         if force_observe_after_wrong:
             action, _forced = _apply_force_observe(action, pending_forced_observe)
             pending_forced_observe = False
@@ -897,6 +898,7 @@ def run_session(
                     "action_parsed": action, "engine_text": f"[400→observe] {fallback_text}",
                     "usage": usage,
                     "context_telemetry": _asdict_or_none(turn_telem),
+                    "outcome": act_data.get("outcome"), "forced_observe": _forced,
                 })
                 current_engine_text = fallback_text
                 observed_here = True  # the fallback dispatched an observe
@@ -973,6 +975,10 @@ def run_session(
                 user_content = engine_text + history_block
             turns_log.append({"turn": turn, "model_text": model_text, "model_reasoning": model_reasoning, "action_parsed": action, "engine_text": engine_text, "injected_history": history_block or None, "truncated": truncated})
             messages.append({"role": "user", "content": user_content})
+        # Per-turn instrument fields (MCV chunk 06 mechanism assertion): the engine's outcome for
+        # this turn's action and whether the harness forced it. Additive — no behavior change.
+        turns_log[-1]["outcome"] = act_data.get("outcome")
+        turns_log[-1]["forced_observe"] = _forced
         completed = act_data.get("completed", False)
 
         if completed:
