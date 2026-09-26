@@ -40,6 +40,12 @@ Options:
                   supplied from `journalctl -u ollama | grep n_ctx_slot` (scripts/e1a-run-row.sh
                   has the SSH+grep recipe). NOT auto-detected: ollama's /v1 endpoint silently
                   drops --num-ctx (options), so the CLI flag can never be trusted as ground truth.
+  --force-observe-after-wrong  Rung-iii arm (MCV chunk 05): after ANY wrong gate commit (a
+                  "locked" or routing-gate "wrong" outcome), force next turn's action to observe —
+                  regardless of what the model proposes — instead of leaving the look to the
+                  model's own choice. Orthogonal to --context-policy/--look-gate; tests whether an
+                  enforced look-after-failure rule closes the gap for a context policy (e.g.
+                  wipe-curated-norefresh) that gets no free refresh.
 
 Locking through a gateway:
   The per-host VRAM lock (see _lock_path below) exists to stop two concurrent runs from
@@ -525,6 +531,33 @@ def _null_state_line(text: str) -> str:
     return re.sub(r"(\[STATE[^\]]*\])(.*)", lambda m: m.group(1) + re.sub(r"(\w+) = (\d+)", lambda mm: f"{mm.group(1)} = UNAVAILABLE", m.group(2)), text)
 
 
+def _forces_observe_next(outcome: str | None) -> bool:
+    """--force-observe-after-wrong (rung iii, MCV chunk 05): whether THIS turn's engine outcome
+    (act_data['outcome']) means the NEXT turn's action must be forced to observe. True only for a
+    gate commit the engine scored WRONG: "locked" (the lock-gate path — stays put, a life spent)
+    or "wrong" (the routing-gate path — bounced to a wrong-destination room, also a life spent).
+    Every other outcome ("ok", "exit", "out_of_lives", "budget_exhausted", "impossible",
+    "loop_trapped", "back", or None for a non-commit action) leaves the model's own next choice
+    alone — in particular a terminal outcome (out_of_lives, budget_exhausted, impossible) never
+    forces anything, because the loop's `if completed: break` runs before there is a next turn."""
+    return outcome in ("locked", "wrong")
+
+
+def _apply_force_observe(action: dict, pending: bool) -> tuple[dict, bool]:
+    """The --force-observe-after-wrong interceptor's pure core. `pending` is this turn's
+    _forces_observe_next verdict carried over from the PREVIOUS turn's outcome. When pending,
+    the action to dispatch is unconditionally {"action": "observe"} — this overrides ANY
+    proposed action, including an observe the model already chose or a legal commit at a
+    different gate. Unlike the look-gate interceptor (which only blocks an answer-bearing commit
+    at a node not observed since arrival), this rule does not check what the model proposed —
+    the point is to test whether the LOOK itself is what a free refresh buys, not merely to
+    forbid illegal guesses. Returns (action_to_dispatch, fired) so the caller can count firings
+    without re-deriving the condition."""
+    if not pending:
+        return action, False
+    return {"action": "observe"}, True
+
+
 def run_session(
     maze_url: str,
     base_url: str,
@@ -553,6 +586,7 @@ def run_session(
     look_gate: bool = False,
     recommend_observe: bool = False,
     observe_cap: bool = False,
+    force_observe_after_wrong: bool = False,
     context_policy_name: str | None = None,
     policy_code_ref: str | None = None,
     n_ctx_slot: int | None = None,
@@ -646,6 +680,12 @@ def run_session(
     # postmortem found 46/48 wrong answers were unobserved guesses. observed_here starts True
     # because the loop bootstraps an observe above (line ~460), same as every control run.
     observed_here = True
+    # Forced-observe-after-WRONG (rung iii, MCV chunk 05): pending_forced_observe carries
+    # _forces_observe_next's verdict on the PREVIOUS turn's outcome into THIS turn's interceptor;
+    # False before turn 1 (the bootstrap observe above is not a gate commit). Active only under
+    # --force-observe-after-wrong.
+    pending_forced_observe = False
+    forced_observe_after_wrong_count = 0
     # Consecutive-observe cap (amendment, 2026-07-06): the look-gate's mirror-image pathology is
     # over-observation — at a gate it can't solve, the model re-observes forever (observe is free →
     # never dies, never exits → spins to the turn cap; one run looped 250× at one node / 125 min).
@@ -778,6 +818,19 @@ def run_session(
                 action = {"action": "observe"}
                 norm_action_count += 1
 
+        # Forced-observe-after-WRONG interceptor (rung iii, MCV chunk 05): unconditionally
+        # override the proposed action to observe when the PREVIOUS turn's commit was scored
+        # WRONG. Placed before the path_id remap and the look-gate check so both see the final,
+        # already-overridden action (harmless no-ops on an observe). Consumed once per turn
+        # regardless of whether it fires — see _apply_force_observe's docstring.
+        if force_observe_after_wrong:
+            action, _forced = _apply_force_observe(action, pending_forced_observe)
+            pending_forced_observe = False
+            if _forced:
+                forced_observe_after_wrong_count += 1
+                if verbose:
+                    print(f"  [turn {turn}] FORCE-OBSERVE: previous commit was WRONG — injecting observe")
+
         # Remap numeric path_id (e.g. "1", "2") to the actual path label from the last observe.
         # Models sometimes confuse gate option numbers with path labels.
         if action.get("action") == "commit":
@@ -848,6 +901,8 @@ def run_session(
                 current_engine_text = fallback_text
                 observed_here = True  # the fallback dispatched an observe
                 consecutive_observes += 1  # counts toward the observe-cap like any other observe
+                if force_observe_after_wrong:
+                    pending_forced_observe = _forces_observe_next(act_data.get("outcome"))
                 if policy is None and not stateless:
                     messages.append({"role": "user", "content": fallback_text})
                 completed = act_data.get("completed", False)
@@ -869,6 +924,9 @@ def run_session(
             consecutive_observes = 0
         elif _dispatched == "note":
             consecutive_observes = 0
+
+        if force_observe_after_wrong:
+            pending_forced_observe = _forces_observe_next(act_data.get("outcome"))
 
         engine_text = _maybe_corrupt(act_data.get("text", ""))
         if verbose:
@@ -970,6 +1028,8 @@ def run_session(
     score_data["look_gate_interceptions"] = look_gate_interceptions
     score_data["look_gate_observe_cap"] = _OBSERVE_CAP if observe_cap else None
     score_data["observe_loop_terminated"] = observe_loop_terminated
+    score_data["force_observe_after_wrong"] = force_observe_after_wrong
+    score_data["forced_observe_after_wrong_count"] = forced_observe_after_wrong_count
     score_data["inject_history"] = inject_history
     score_data["kos_prompt"] = kos_prompt
     score_data["stateless"] = stateless
@@ -1142,6 +1202,12 @@ def main():
                     help="End the episode + score from /state after 5 consecutive observes at a node "
                          "(the observe-loop pathology guard). Decoupled from --look-gate so all observe-"
                          "policies (prereg 15) share identical termination. --look-gate implies it.")
+    ap.add_argument("--force-observe-after-wrong", action="store_true",
+                    help="Rung-iii arm (MCV chunk 05): after ANY wrong gate commit (outcome 'locked' or "
+                         "'wrong'), force next turn's action to observe regardless of what the model "
+                         "proposes — an enforced look-after-failure rule, distinct from --look-gate (which "
+                         "only blocks an answer-bearing commit at an unobserved node). Orthogonal to "
+                         "--context-policy; combine with e.g. --context-policy wipe-curated-norefresh.")
     # ── Pluggable context policy (lb-post-release chunk 02) ───────────────────────
     ap.add_argument("--context-policy", choices=sorted(context_policy.POLICIES), default=None,
                     help="Named ContextPolicy (cli/context_policy.py) — arms as config, not a "
@@ -1234,6 +1300,7 @@ def main():
                     look_gate=args.look_gate,
                     recommend_observe=args.recommend_observe,
                     observe_cap=args.observe_cap,
+                    force_observe_after_wrong=args.force_observe_after_wrong,
                     context_policy_name=args.context_policy,
                     policy_code_ref=args.policy_code_ref,
                     n_ctx_slot=args.n_ctx_slot,
