@@ -94,6 +94,12 @@ _DEFAULT_DB_URL = os.environ.get("DB_URL", "")
 # byte arrives; a flat 600s read timeout cancels them mid-load. Override via env.
 _LLM_TIMEOUT_SECS = float(os.environ.get("LB_LLM_TIMEOUT", "1800"))
 _HEARTBEAT_STALE_SECS = 600  # lock is hung if heartbeat older than this
+# Runner v2 (MCV chunk 04 owed item, read out 2026-09-09): a mid-campaign HTTP 500 from the
+# model upstream used to propagate straight out of _llm_call, uncaught by the connection-error
+# retry loop below, and lose the whole row. One retry after a short settle, same idea as the
+# connection-error backoff but a fixed single attempt, not a counted loop — a second consecutive
+# 500 is treated as a real server-side failure, not a blip.
+_HTTP_500_SETTLE_SECONDS = float(os.environ.get("LB_HTTP_500_SETTLE", "15"))
 
 
 def _lock_path(base_url: str, lock_host: str | None = None) -> Path:
@@ -425,11 +431,27 @@ def _llm_call(llm: httpx.Client, model: str, messages: list, retries: int = 3, o
     `message` on the native path is therefore also treated as a failed call → fall through to /v1,
     same as the HTTPStatusError case. The returned dict always carries `usage` (OpenAI-shaped) when
     the server reported one, on either path — token-usage capture (todo-ai backlog item) reads this
-    per turn."""
+    per turn.
+
+    Runner v2 (owed since MCV chunk 04, 2026-09-09): an HTTP 500 from the /chat/completions call
+    is retried EXACTLY ONCE, after a settle (_HTTP_500_SETTLE_SECONDS), distinct from the connection-
+    error backoff loop below (which already retries up to `retries` times for dropped/reset
+    connections). Before this, raise_for_status() on a 500 raised httpx.HTTPStatusError, which the
+    except clause below never caught, so the row aborted immediately — main()'s campaign loop then
+    recorded the whole run_session() as a bare {"error": ...} row with no depth/turns, losing
+    everything the trajectory had already done. A SECOND consecutive 500 is re-raised (recorded as
+    an error row by the caller) rather than retried again — a repeat 500 is a real server-side
+    failure, not a transient blip."""
     last_exc = None
+    http_500_retried = False
     _base = str(llm.base_url).rstrip("/")
     _native = (_base[:-3] if _base.endswith("/v1") else _base) + "/api/chat"
-    for attempt in range(retries):
+    # A manual counter, not `for attempt in range(retries)`: the one allowed 500-retry (below)
+    # must never be starved by an unlucky interleaving where connection errors already spent the
+    # `retries` budget on THIS attempt slot — it does not increment `attempt`, so it is always
+    # available exactly once regardless of how many connection-retries preceded it.
+    attempt = 0
+    while attempt < retries:
         try:
             if think is not None:
                 try:
@@ -466,6 +488,19 @@ def _llm_call(llm: httpx.Client, model: str, messages: list, retries: int = 3, o
             last_exc = e
             print(f"  LLM call attempt {attempt+1}/{retries} failed: {type(e).__name__}: {e} — retrying")
             time.sleep(5 * (attempt + 1))
+            attempt += 1
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 500 and not http_500_retried:
+                http_500_retried = True
+                last_exc = e
+                print(f"  LLM call got HTTP 500 from the upstream — retrying once after a "
+                      f"{_HTTP_500_SETTLE_SECONDS:.0f}s settle")
+                time.sleep(_HTTP_500_SETTLE_SECONDS)
+                continue  # does NOT consume the connection-retry attempt budget above
+            # Not a 500, or the one allowed 500-retry already happened: this row is lost — let it
+            # propagate to main()'s campaign loop, which records {"error": ...} for this run.
+            raise
     raise last_exc
 
 
@@ -990,6 +1025,39 @@ def run_session(
     return score_data
 
 
+def _preflight_upstream(base_url: str, api_key: str | None = None, timeout: float = 10.0,
+                         client: httpx.Client | None = None) -> bool:
+    """Runner v2 (MCV chunk 04 owed item, read out 2026-09-09): a token-free reachability check
+    for the model upstream, run ONCE before any campaign row is attempted. Before this, a dead/
+    unreachable upstream was discovered only PER ROW — each of --runs rows independently burned
+    the full connection-error retry-and-backoff cycle in _llm_call (up to 3 attempts, ~30s), then
+    silently degraded into a bare {"error": ...} row in main()'s campaign loop, so a 30-run
+    campaign against a dead upstream took ~15 minutes to fail 30 times instead of failing once,
+    fast. Mirrors cli/doctor.py's check 1 (GET {base_url}/models) — doctor.py is the standalone,
+    human-run preflight tool; this is the same check inlined into the runner itself, since the
+    campaign scripts (MCV rung (iii), point-and-click chunk 01) invoke run_eval.py directly and
+    never doctor.py. Read-only: no completion request, no state change, zero tokens spent.
+
+    Returns True when the upstream answered; False (with a FAIL message on stderr) when it did
+    not. `client` is an injection point for tests — a stub only needs a `.get(url)` method."""
+    own_client = client is None
+    c = client or httpx.Client(
+        timeout=timeout,
+        headers={"Authorization": f"Bearer {api_key}"} if api_key else None,
+    )
+    try:
+        r = c.get(f"{base_url.rstrip('/')}/models")
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"PREFLIGHT FAILED: model upstream unreachable at {base_url} — "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return False
+    finally:
+        if own_client:
+            c.close()
+
+
 def main():
     ap = argparse.ArgumentParser(description="LabyrinthBench CLI harness")
     ap.add_argument("--model", required=True)
@@ -1106,6 +1174,11 @@ def main():
     if args.context_policy and (args.overlay_only or args.stateless or args.inject_history or args.kos_prompt):
         ap.error("--context-policy is mutually exclusive with --overlay-only/--stateless/"
                  "--inject-history/--kos-prompt — those stay on the untouched legacy path.")
+
+    # Runner v2 preflight (MCV chunk 04 owed item): fail loud and fast, before --acquire_lock or
+    # any of --runs rows, when the model upstream is dead — see _preflight_upstream's docstring.
+    if not _preflight_upstream(args.base_url, api_key=args.api_key):
+        sys.exit(1)
 
     llm_options = {"num_ctx": args.num_ctx} if args.num_ctx else None
 

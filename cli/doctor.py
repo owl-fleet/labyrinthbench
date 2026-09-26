@@ -27,6 +27,7 @@ Exit codes: 0 = ready; 1 = at least one check failed; 2 = usage error.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from urllib.parse import urlparse
 
