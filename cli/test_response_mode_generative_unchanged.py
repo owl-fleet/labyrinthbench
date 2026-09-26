@@ -82,8 +82,10 @@ check("forced-choice-style call: max_tokens/logprobs/top_logprobs/grammar all pr
 gen_prompt = run_eval.build_system_prompt("", pull_state=False, state_label="", recommend_observe=False)
 check("generative system prompt still demands a JSON object",
       "Respond with ONLY a valid JSON object" in gen_prompt)
-check("generative system prompt says nothing about a menu/label",
-      "label" not in gen_prompt.lower() and "menu" not in gen_prompt.lower())
+# main's generative prompt already says "the path label from observe()", so "label" alone is not
+# a leak; the forced-choice instruction is "menu" / "single label character".
+check("generative system prompt says nothing about a menu or a single-label reply",
+      "menu" not in gen_prompt.lower() and "single label character" not in gen_prompt.lower())
 
 fc_prompt = run_eval.build_forced_choice_system_prompt("")
 check("forced-choice system prompt demands a single label character",
