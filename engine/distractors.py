@@ -5,8 +5,8 @@ candidate answers instead of letting the model free-generate one. This module ow
 DISTRACTOR-VALUE generation only — pure and deterministic, no RNG. Menu-level randomization
 (option shuffle, label assignment, label-set rotation) is the CALLER's concern
 (cli/run_eval.py), kept separate on purpose: the experimenter's one frozen lever (this file,
-pre-registered before any row is read — see knowledge/projects/plans/point-and-click/
-01-forced-choice-arm-nav3.md) must never be entangled with the harness's independently-seeded
+pre-registered before any row is read, in the experiment's own pre-registration) must never
+be entangled with the harness's independently-seeded
 position/label controls.
 
 Rules, tried in this fixed priority order until `n` distinct distractors (all != expected, all
