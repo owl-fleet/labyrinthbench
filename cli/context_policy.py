@@ -556,6 +556,81 @@ class WipeCuratedPlusActionsPolicy(ContextPolicy):
         return {"wipe_events": self._wipes, "ledger_entries": len(self._ledger), "ledger_wrong_commits": self._wrong}
 
 
+class WipeCuratedPlusPadPolicy(WipeCuratedPolicy):
+    """wipe-curated PLUS a CONDITIONAL failure pad (marginal-context-value chunk 07, Will's
+    2026-09-27 proposal: "smooth sailing doesn't need a record of previous failures").
+
+    Every WRONG commit is recorded as (gate_id, answer), but the pad enters context only while the
+    model stands at a gate that has already failed at least once, and then lists ONLY that gate's
+    WRONG answers, as exclusions. Nothing on a gate's first attempt, nothing once it is passed, no
+    successes (--show-recall already carries those), no reasoning (replaying the failed turn's
+    argument is what makes accumulate re-derive the same wrong answer).
+
+    The contrast arm is wipe-curated+actions: the same failures, but ALWAYS shown, successes
+    included. W and R are inherited from WipeCuratedPolicy unchanged, so the pad is the only
+    difference from the wiped reference.
+    """
+
+    name = "wipe-curated+pad"
+    generality_class = "task-general"
+    PAD_HEADER = "[FAILED ANSWERS ON THIS GATE — each was WRONG; do not submit them again]"
+    _GATE_RX = re.compile(r"\[GATE\s+([^:\]\s]+)\s*:")
+
+    def __init__(self, sys_prompt: str):
+        super().__init__(sys_prompt)
+        self._failed: dict = {}        # gate_id -> [answers], first-failed first, no duplicates
+        self._last_block = ""
+        self._shown_turns = 0
+
+    def _current_gate(self, engine_text: str) -> Optional[str]:
+        m = self._GATE_RX.search(engine_text or "")
+        return m.group(1) if m else None
+
+    def _pad_block(self, engine_text: str) -> str:
+        gate = self._current_gate(engine_text)
+        answers = self._failed.get(gate) if gate else None
+        if not answers:
+            return ""
+        return f"{self.PAD_HEADER}\n{gate}: {', '.join(answers)}"
+
+    def turn_start(self, snap: TurnSnapshot) -> list:
+        msgs = super().turn_start(snap)
+        block = self._pad_block(snap.engine_text)
+        self._last_block = block
+        if block:
+            self._shown_turns += 1
+            msgs[1] = {"role": "user", "content": snap.engine_text + "\n\n" + block}
+        return msgs
+
+    def turn_end(self, snap: TurnSnapshot) -> None:
+        a = snap.action or _parse_action_text(snap.model_text)
+        if not a or a.get("action") != "commit" or not snap.gate_id:
+            return
+        t = snap.engine_text or ""
+        if "WRONG" not in t and "LOCKED" not in t:
+            return
+        ans = str(a.get("answer", "")).strip()
+        seen = self._failed.setdefault(snap.gate_id, [])
+        if ans and ans not in seen:
+            seen.append(ans)
+
+    def telemetry(self, snap: TurnSnapshot, call_messages: list) -> ContextTelemetry:
+        return ContextTelemetry(
+            turn=snap.turn,
+            policy=self.name,
+            injected_chars={"overlay": len(snap.engine_text), "history": 0, "facts": 0,
+                            "scratchpad": len(self._last_block)},
+            context_size_at_commit=sum(len(m["content"]) for m in call_messages),
+            wipe_event=True,
+        )
+
+    def task_end(self) -> dict:
+        return {"wipe_events": self._wipes,
+                "pad_entries": sum(len(v) for v in self._failed.values()),
+                "pad_gates": len(self._failed),
+                "pad_shown_turns": self._shown_turns}
+
+
 class WipeCuratedPlusPointerPolicy(_StubPolicy):
     """Cell 3 target: wipe-curated plus a 'previous gate' pointer label — the off-by-one the
     turnlog pass identified. DEG-aware (encodes nav-3's chain structure), not task-general —
@@ -580,6 +655,7 @@ POLICIES: dict = {
         CompactPolicy,
         ScratchpadPolicy,
         WipeCuratedPlusActionsPolicy,
+        WipeCuratedPlusPadPolicy,        # marginal-context-value chunk 07: the conditional failure pad
         WipeCuratedPlusPointerPolicy,
     )
 }
@@ -702,6 +778,43 @@ def _smoke() -> int:
     telem = wa.telemetry(TurnSnapshot(turn=4, sys_prompt="SYS", engine_text="obs4"), m4)
     if not telem.wipe_event or telem.injected_chars["history"] <= 0 or telem.injected_chars["overlay"] != 4:
         fails.append(f"wipe-curated+actions telemetry malformed: {telem}")
+
+    # wipe-curated+pad (MCV chunk 07): failures enter context ONLY while the current gate is
+    # failing, and list only that gate's WRONG answers.
+    def _obs(gid: str) -> str:
+        return f"--- OBSERVE ---\nLocation: nX\nPaths:\n  forward: gate  [GATE {gid}: Add 5 to your c1a answer]\n"
+    _locked = "--- LOCKED ---\nGate answer: WRONG — the gate does not open.\nLocation: n8\nGate 9.\n"
+    _ok = "--- OK ---\nGate answer: CORRECT\nLocation: n9\nGate 10.\n"
+    pp = make_policy("wipe-curated+pad", "SYS")
+    m1 = pp.turn_start(TurnSnapshot(turn=1, sys_prompt="SYS", engine_text=_obs("c3c")))
+    if m1 != [{"role": "system", "content": "SYS"}, {"role": "user", "content": _obs("c3c")}]:
+        fails.append(f"wipe-curated+pad first attempt must be the bare overlay: {m1}")
+    pp.turn_end(TurnSnapshot(turn=1, sys_prompt="SYS", model_text='{"action": "commit", "path_id": "forward", "answer": "59"}',
+                             engine_text=_locked, gate_id="c3c"))
+    m2 = pp.turn_start(TurnSnapshot(turn=2, sys_prompt="SYS", engine_text=_obs("c3c")))
+    u2 = m2[1]["content"]
+    if not (u2.startswith(_obs("c3c")) and WipeCuratedPlusPadPolicy.PAD_HEADER in u2 and u2.rstrip().endswith("c3c: 59")):
+        fails.append(f"wipe-curated+pad must show c3c's WRONG after one failure:\n{u2}")
+    pp.turn_end(TurnSnapshot(turn=2, sys_prompt="SYS", model_text='{"action": "commit", "path_id": "forward", "answer": "59"}',
+                             engine_text=_locked, gate_id="c3c"))           # a repeat: must not duplicate
+    pp.turn_end(TurnSnapshot(turn=3, sys_prompt="SYS", model_text='{"action": "commit", "path_id": "forward", "answer": "35"}',
+                             engine_text=_locked, gate_id="c3c"))
+    u4 = pp.turn_start(TurnSnapshot(turn=4, sys_prompt="SYS", engine_text=_obs("c3c")))[1]["content"]
+    if not u4.rstrip().endswith("c3c: 59, 35"):
+        fails.append(f"wipe-curated+pad must list each WRONG once, in order:\n{u4}")
+    pp.turn_end(TurnSnapshot(turn=4, sys_prompt="SYS", model_text='{"action": "observe"}', engine_text=_obs("c3c")))
+    pp.turn_end(TurnSnapshot(turn=5, sys_prompt="SYS", model_text='{"action": "commit", "path_id": "forward", "answer": "61"}',
+                             engine_text=_ok, gate_id="c3c"))
+    m6 = pp.turn_start(TurnSnapshot(turn=6, sys_prompt="SYS", engine_text=_obs("c4a")))
+    if m6 != [{"role": "system", "content": "SYS"}, {"role": "user", "content": _obs("c4a")}]:
+        fails.append(f"wipe-curated+pad must vanish on the next gate (smooth sailing): {m6}")
+    t6 = pp.telemetry(TurnSnapshot(turn=6, sys_prompt="SYS", engine_text=_obs("c4a")), m6)
+    if t6.injected_chars["scratchpad"] != 0 or not t6.wipe_event:
+        fails.append(f"wipe-curated+pad telemetry on a clean gate: {t6}")
+    if pp.task_end() != {"wipe_events": 4, "pad_entries": 2, "pad_gates": 1, "pad_shown_turns": 2}:
+        fails.append(f"wipe-curated+pad task_end: {pp.task_end()}")
+    if not pp.needs_observe_refresh:
+        fails.append("wipe-curated+pad must inherit the free refresh (W+R+M+P)")
 
     # accumulate+ledger (MCV s4): plain accumulate history + ONE ledger line on the current
     # observation; entries appear only after the engine says CORRECT, labelled from what the
@@ -892,7 +1005,7 @@ def _smoke() -> int:
         for f in fails:
             print(f"  ✗ {f}")
         return 1
-    print("[context_policy smoke] PASS — wipe-curated/accumulate/wipe-curated+actions/accumulate+ledger/"
+    print("[context_policy smoke] PASS — wipe-curated/accumulate/wipe-curated+actions/wipe-curated+pad/accumulate+ledger/"
           "drop-old-engine/accumulate+refresh/wipe-curated-norefresh message construction verified "
           "(including the null-arm regression), stubs refuse construction, the provenance gate holds.")
     return 0
