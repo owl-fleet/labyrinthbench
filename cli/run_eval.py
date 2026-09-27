@@ -720,7 +720,7 @@ def _native_usage(native_json: dict) -> dict | None:
 
 def _llm_call(llm: httpx.Client, model: str, messages: list, retries: int = 3, options: dict | None = None, think: bool | None = None,
                max_tokens: int | None = None, logprobs: bool = False, top_logprobs: int | None = None,
-               grammar: str | None = None) -> dict:
+               grammar: str | None = None, chat_template_kwargs: dict | None = None) -> dict:
     """Call the model with retry. When `think` is set we MUST use Ollama's NATIVE /api/chat endpoint:
     the OpenAI-compat /v1/chat/completions SILENTLY IGNORES a top-level `think` field, so `think:false`
     there does NOT suppress reasoning (verified on qwen3:14b — reasoning_len ~600 via /v1 vs 0 via
@@ -800,6 +800,8 @@ def _llm_call(llm: httpx.Client, model: str, messages: list, retries: int = 3, o
                 payload["top_logprobs"] = top_logprobs
             if grammar is not None:
                 payload["grammar"] = grammar
+            if chat_template_kwargs is not None:
+                payload["chat_template_kwargs"] = chat_template_kwargs
             r = llm.post("/chat/completions", json=payload)
             r.raise_for_status()
             return r.json()
@@ -1041,7 +1043,12 @@ def run_session(
             llm_json = _llm_call(llm, model, call_messages, options=options, think=None,
                                   max_tokens=4, logprobs=(fc_selection == "logprobs"),
                                   top_logprobs=fc_top_logprobs if fc_selection == "logprobs" else None,
-                                  grammar=fc_grammar)
+                                  grammar=fc_grammar,
+                                  # Measured 2026-09-26 (chunk 01 smoke): with only /no_think, qwen3's
+                                  # template still EMITS an empty <think></think> block — 4 tokens, the
+                                  # whole max_tokens budget — so the label never reached token 0. The
+                                  # kwarg makes the template PRE-FILL that block; the label is token 0.
+                                  chat_template_kwargs={"enable_thinking": False})
         else:
             llm_json = _llm_call(llm, model, call_messages, options=options, think=False if no_think else None)
         _update_heartbeat(base_url, lock_host)
