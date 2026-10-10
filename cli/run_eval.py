@@ -381,21 +381,24 @@ def _fc_build_menu(state: _FCState, rng: "random.Random", label_set: list,
     return _FCMenu(labels=labels, options=dict(zip(labels, opts)))
 
 
+def _fc_option_desc(act: dict) -> str:
+    """One menu option's description — shared by the rendered text menu and the systemone
+    criteria, so every selection method is shown the identical wording."""
+    if act["action"] == "observe":
+        return "observe (look around; free, no step cost)"
+    if act.get("path_id") == "back":
+        return "go back to your previous location (costs one step)"
+    if act["action"] == "commit" and act.get("answer") == NONE_OF_THESE:
+        return f"path {act['path_id']!r}: none of the candidate answers is correct"
+    if act["action"] == "commit" and act.get("answer"):
+        return f"path {act['path_id']!r}: answer = {act['answer']}"
+    return f"path {act['path_id']!r}: take this open path"
+
+
 def _fc_render_menu(menu: _FCMenu) -> str:
     lines = ["", "--- CHOOSE ONE ---"]
     for label in menu.labels:
-        act = menu.options[label].action
-        if act["action"] == "observe":
-            desc = "observe (look around; free, no step cost)"
-        elif act.get("path_id") == "back":
-            desc = "go back to your previous location (costs one step)"
-        elif act["action"] == "commit" and act.get("answer") == NONE_OF_THESE:
-            desc = f"path {act['path_id']!r}: none of the candidate answers is correct"
-        elif act["action"] == "commit" and act.get("answer"):
-            desc = f"path {act['path_id']!r}: answer = {act['answer']}"
-        else:
-            desc = f"path {act['path_id']!r}: take this open path"
-        lines.append(f"  {label}) {desc}")
+        lines.append(f"  {label}) {_fc_option_desc(menu.options[label].action)}")
     lines.append("Respond with exactly one label character.")
     return "\n".join(lines)
 
@@ -418,6 +421,82 @@ def _fc_build_grammar(labels: list) -> str:
     determines, live, which path a given upstream needs; see --fc-selection)."""
     alts = " | ".join(f'"{l}"' for l in labels)
     return f"root ::= ({alts})\n"
+
+
+# ── systemone selection (point-and-click chunk 01b) ──────────────────────────────────────────
+# A dedicated decision model scores the SAME menu through the `/v1/systemone` request shape
+# (state + typed questions in; a choice, a per-option probability and a confidence out; one
+# prefill, no generated text). The menu goes in as the question's `criteria`, in its shuffled
+# order and under its rotated labels, so position and label controls carry over unchanged; the
+# state is the turn's context WITHOUT the rendered menu, and the system framing (minus the
+# reply-with-one-character tail) becomes the question's instructions. The response shape is read
+# defensively: `probabilities` keyed by label or listed in criteria order, `choice` a label. The
+# exact shape each server returns is checked live by the chunk's mechanism fixture before any row.
+FC_SYSTEMONE_QUESTION = "next_action"
+
+
+def _fc_systemone_request(model: str, call_messages: list, menu: _FCMenu) -> dict:
+    instructions = "\n\n".join(m["content"] for m in call_messages if m.get("role") == "system")
+    instructions = instructions.replace(_FC_JSON_TAIL, "").strip()
+    state = "\n\n".join(f"[{m.get('role')}]\n{m.get('content', '')}"
+                        for m in call_messages if m.get("role") != "system")
+    return {
+        "model": model,
+        "state": {"context": state},
+        "questions": {FC_SYSTEMONE_QUESTION: {
+            "type": "choice",
+            "instructions": (instructions + "\n\nWhich option should be taken now?").strip(),
+            "criteria": {label: _fc_option_desc(menu.options[label].action) for label in menu.labels},
+        }},
+    }
+
+
+def _fc_extract_systemone_probs(answer: dict, labels: list) -> dict | None:
+    """Per-label probability vector from a systemone choice answer, renormalized over the menu's
+    labels; None (never raises) when the shape does not cover every label."""
+    probs = answer.get("probabilities") if isinstance(answer, dict) else None
+    raw: dict[str, float] = {}
+    try:
+        if isinstance(probs, dict):
+            raw = {l: float(probs[l]) for l in labels if l in probs}
+        elif isinstance(probs, list) and len(probs) == len(labels):
+            raw = {l: float(p) for l, p in zip(labels, probs)}
+    except (TypeError, ValueError):
+        return None
+    z = sum(raw.values())
+    if len(raw) != len(labels) or z <= 0:
+        return None
+    return {l: v / z for l, v in raw.items()}
+
+
+def _fc_systemone_call(llm: httpx.Client, model: str, call_messages: list, menu: _FCMenu,
+                       retries: int = 3) -> dict:
+    """POST one systemone decision to `<base_url>/systemone` (base_url ends in /v1) and return an
+    OpenAI-shaped dict, so the turn loop's shared plumbing (finish_reason, usage, model_text)
+    reads it unchanged; the raw answer and the wall-clock latency ride along under `systemone`.
+    Connection errors retry with backoff; an HTTP error raises (the row is recorded as an error,
+    same as a failed chat call)."""
+    url = str(llm.base_url).rstrip("/") + "/systemone"
+    payload = _fc_systemone_request(model, call_messages, menu)
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            t0 = time.monotonic()
+            r = llm.post(url, json=payload)
+            latency_ms = (time.monotonic() - t0) * 1000.0
+            r.raise_for_status()
+            body = r.json()
+            answer = (body.get("answers") or {}).get(FC_SYSTEMONE_QUESTION) or {}
+            return {
+                "choices": [{"message": {"content": str(answer.get("choice") or "")},
+                             "finish_reason": "stop"}],
+                "usage": body.get("usage"),
+                "systemone": {"answer": answer, "latency_ms": latency_ms},
+            }
+        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.TimeoutException) as e:
+            last_exc = e
+            time.sleep(2 ** attempt)
+    raise RuntimeError(f"systemone call failed after {retries} attempts: {last_exc}")
 
 
 def _fc_extract_label_probs(llm_json: dict, labels: list) -> dict | None:
@@ -470,13 +549,32 @@ def _fc_score_turn(llm_json: dict, menu: _FCMenu, selection: str) -> dict:
     (F3: is scoring mode itself unusable on this model?)."""
     prob_vec = None
     method = selection
+    confidence = None
+    latency_ms = None
+    label = None
     if selection == "logprobs":
         prob_vec = _fc_extract_label_probs(llm_json, menu.labels)
         if prob_vec is None:
             method = "logprobs-unavailable-text-fallback"
-    if prob_vec is not None:
+    elif selection == "systemone":
+        so = llm_json.get("systemone") or {}
+        answer = so.get("answer") or {}
+        latency_ms = so.get("latency_ms")
+        prob_vec = _fc_extract_systemone_probs(answer, menu.labels)
+        try:
+            confidence = float(answer["confidence"]) if answer.get("confidence") is not None else None
+        except (TypeError, ValueError):
+            confidence = None
+        # The model's own `choice` is the pick; the vector is for the metrics. A choice that is
+        # not a menu label falls through to argmax, then to the text path below.
+        choice = str(answer.get("choice") or "").strip().upper()
+        if choice in menu.labels:
+            label = choice
+        elif prob_vec is None:
+            method = "systemone-unparsed-text-fallback"
+    if label is None and prob_vec is not None:
         label = max(prob_vec, key=prob_vec.get)
-    else:
+    if label is None:
         text = (llm_json["choices"][0]["message"].get("content") or "").strip().upper()
         label = next((l for l in menu.labels if text.startswith(l)), None)
         if label is None:
@@ -491,6 +589,8 @@ def _fc_score_turn(llm_json: dict, menu: _FCMenu, selection: str) -> dict:
         "top1_margin": margin,
         "option_count": len(menu.labels),
         "selection_method": method,
+        "decision_confidence": confidence,
+        "decision_latency_ms": latency_ms,
     }
 
 
@@ -1078,17 +1178,22 @@ def run_session(
         fc_menu = None
         if response_mode == "forced-choice":
             fc_menu = _fc_build_menu(fc_state, fc_rng, fc_label_set, max_distractors=fc_max_distractors)
+            fc_premenu_messages = call_messages
             call_messages = _fc_append_menu(call_messages, _fc_render_menu(fc_menu))
             fc_grammar = _fc_build_grammar(fc_menu.labels) if fc_selection == "grammar" else None
-            llm_json = _llm_call(llm, model, call_messages, options=options, think=None,
-                                  max_tokens=4, logprobs=(fc_selection == "logprobs"),
-                                  top_logprobs=fc_top_logprobs if fc_selection == "logprobs" else None,
-                                  grammar=fc_grammar,
-                                  # Measured 2026-09-26 (chunk 01 smoke): with only /no_think, qwen3's
-                                  # template still EMITS an empty <think></think> block — 4 tokens, the
-                                  # whole max_tokens budget — so the label never reached token 0. The
-                                  # kwarg makes the template PRE-FILL that block; the label is token 0.
-                                  chat_template_kwargs={"enable_thinking": False})
+            if fc_selection == "systemone":
+                # The menu travels as the question's criteria, not as text in the state.
+                llm_json = _fc_systemone_call(llm, model, fc_premenu_messages, fc_menu)
+            else:
+                llm_json = _llm_call(llm, model, call_messages, options=options, think=None,
+                                      max_tokens=4, logprobs=(fc_selection == "logprobs"),
+                                      top_logprobs=fc_top_logprobs if fc_selection == "logprobs" else None,
+                                      grammar=fc_grammar,
+                                      # Measured 2026-09-26 (chunk 01 smoke): with only /no_think, qwen3's
+                                      # template still EMITS an empty <think></think> block — 4 tokens, the
+                                      # whole max_tokens budget — so the label never reached token 0. The
+                                      # kwarg makes the template PRE-FILL that block; the label is token 0.
+                                      chat_template_kwargs={"enable_thinking": False})
         else:
             llm_json = _llm_call(llm, model, call_messages, options=options, think=False if no_think else None)
         _update_heartbeat(base_url, lock_host)
@@ -1121,6 +1226,7 @@ def run_session(
         fc_row_fields = {
             "probability_vector": None, "top1_margin": None, "option_count": None,
             "selection_method": None, "argmax_fixpoint": None,
+            "decision_confidence": None, "decision_latency_ms": None,
         }
         if response_mode == "forced-choice":
             fc_scored = _fc_score_turn(llm_json, fc_menu, fc_selection)
@@ -1142,6 +1248,8 @@ def run_session(
                 "option_count": fc_scored["option_count"],
                 "selection_method": fc_scored["selection_method"],
                 "argmax_fixpoint": fc_argmax_fixpoint,
+                "decision_confidence": fc_scored["decision_confidence"],
+                "decision_latency_ms": fc_scored["decision_latency_ms"],
             }
             if verbose:
                 print(f"  [turn {turn}] fc-menu options={fc_scored['option_count']} "
@@ -1681,7 +1789,7 @@ def main():
                          "label pick, scored by logprobs (or a constrained grammar — see "
                          "--fc-selection). Orthogonal to --context-policy: pair with "
                          "accumulate/wipe-curated for the chunk 01 2x2.")
-    ap.add_argument("--fc-selection", choices=["logprobs", "grammar"], default="logprobs",
+    ap.add_argument("--fc-selection", choices=["logprobs", "grammar", "systemone"], default="logprobs",
                     help="How a forced-choice turn is decoded. 'logprobs' (default) reads the "
                          "argmax over the label alphabet's logprobs on the first generated token "
                          "— needs an upstream that returns OpenAI-shaped logprobs/top_logprobs on "
@@ -1690,7 +1798,10 @@ def main():
                          "--n-ctx-slot/--lock-host). 'grammar' constrains decoding to the label "
                          "alphabet via a GBNF grammar (llama.cpp-specific request field) and reads "
                          "the output text directly — the fallback for an upstream that can't do "
-                         "the former.")
+                         "the former. 'systemone' sends the menu to a dedicated decision model "
+                         "as one typed choice question at <base-url>/systemone (the Jev-style "
+                         "decision API) and records its per-option probabilities, confidence and "
+                         "latency; --model names the decision model.")
     ap.add_argument("--fc-max-distractors", type=int, default=3,
                     help="Distractor count per gated-path candidate menu (engine/distractors.py), "
                          "before the correct answer and 'none of these' are added. Frozen at 3 "
