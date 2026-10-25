@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import json
 import os
 import time
@@ -623,6 +624,25 @@ __ROWS__
 </html>"""
 
 
+def _esc(value) -> str:
+    """HTML-escape a value (client-supplied or history-file text) for the watch pages."""
+    return html_lib.escape(str(value), quote=True)
+
+
+def _safe_json_for_script(value) -> str:
+    """JSON-encode a value for embedding inside a <script> block.
+
+    json.dumps alone lets a string containing "</script>" close the tag early, so
+    escape the characters that matter to an HTML parser while staying valid JSON.
+    """
+    return (
+        json.dumps(value)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -671,12 +691,13 @@ def watch_list(page: int = Query(1, ge=1)):
             "session_id": s.session_id,
             "model": s.model or "unknown",
             "deg_id": s.deg.id,
-            "steps": f"{s.steps_used}&nbsp;/&nbsp;{s.deg.step_budget}",
+            "steps_used": s.steps_used,
+            "step_budget": s.deg.step_budget,
             "status": ("EXIT ✓" if s.found_exit else ("DNF" if s.completed else ("stalled (no client activity)" if stale else "running..."))),
             "status_cls": status_cls,
             # Completed sessions still in memory replay fine — the stream sends
             # full history then closes — so the watch link stays.
-            "link": f'<a href="/watch/{s.session_id}">watch</a>',
+            "has_link": True,
         })
     for entry in reversed(_history):
         if entry["session_id"] in live_ids:
@@ -686,10 +707,11 @@ def watch_list(page: int = Query(1, ge=1)):
             "session_id": entry["session_id"],
             "model": entry.get("model", "?"),
             "deg_id": entry.get("deg_id", "?"),
-            "steps": f"{entry.get('steps_used','?')}&nbsp;/&nbsp;{entry.get('step_budget','?')}",
-            "status": ("EXIT ✓" if entry.get("found_exit") else f"DNF ({entry.get('failure_reason','')})"),
+            "steps_used": entry.get("steps_used", "?"),
+            "step_budget": entry.get("step_budget", "?"),
+            "status": ("EXIT ✓" if entry.get("found_exit") else f"DNF ({entry.get('failure_reason', '')})"),
             "status_cls": status_cls,
-            "link": "",
+            "has_link": False,
         })
 
     total = len(all_rows)
@@ -699,10 +721,12 @@ def watch_list(page: int = Query(1, ge=1)):
 
     rows_html = ""
     for r in page_rows:
+        steps_html = f"{_esc(r['steps_used'])}&nbsp;/&nbsp;{_esc(r['step_budget'])}"
+        link_html = f'<a href="/watch/{_esc(r["session_id"])}">watch</a>' if r["has_link"] else ""
         rows_html += (
-            f"<tr><td>{r['session_id'][:8]}</td><td>{r['model']}</td>"
-            f"<td>{r['deg_id']}</td><td>{r['steps']}</td>"
-            f"<td class='{r['status_cls']}'>{r['status']}</td><td>{r['link']}</td></tr>"
+            f"<tr><td>{_esc(r['session_id'][:8])}</td><td>{_esc(r['model'])}</td>"
+            f"<td>{_esc(r['deg_id'])}</td><td>{steps_html}</td>"
+            f"<td class='{r['status_cls']}'>{_esc(r['status'])}</td><td>{link_html}</td></tr>"
         )
     if not rows_html:
         rows_html = "<tr><td colspan='6' style='color:#333'>No sessions yet.</td></tr>"
@@ -729,17 +753,17 @@ def watch_list(page: int = Query(1, ge=1)):
 def watch_session(session_id: str):
     s = _get_session(session_id)
     cy_nodes, cy_edges = _build_cy_elements(s.deg)
-    html = _WATCH_SESSION_HTML
-    html = html.replace("__SESSION_ID__", session_id)
-    html = html.replace("__SID__", session_id[:8])
-    html = html.replace("__MODEL__", s.model or "unknown")
-    html = html.replace("__DEG__", s.deg.id)
-    html = html.replace("__BUDGET__", str(s.deg.step_budget))
-    html = html.replace("__OPTIMAL__", str(s.deg.optimal_commits))
-    html = html.replace("__OPTIMAL_PATH_JSON__", json.dumps(s.deg.optimal_path))
-    html = html.replace("__CY_NODES_JSON__", json.dumps(cy_nodes))
-    html = html.replace("__CY_EDGES_JSON__", json.dumps(cy_edges))
-    return html
+    page_html = _WATCH_SESSION_HTML
+    page_html = page_html.replace("__SESSION_ID__", _esc(session_id))
+    page_html = page_html.replace("__SID__", _esc(session_id[:8]))
+    page_html = page_html.replace("__MODEL__", _esc(s.model or "unknown"))
+    page_html = page_html.replace("__DEG__", _esc(s.deg.id))
+    page_html = page_html.replace("__BUDGET__", str(s.deg.step_budget))
+    page_html = page_html.replace("__OPTIMAL__", str(s.deg.optimal_commits))
+    page_html = page_html.replace("__OPTIMAL_PATH_JSON__", _safe_json_for_script(s.deg.optimal_path))
+    page_html = page_html.replace("__CY_NODES_JSON__", _safe_json_for_script(cy_nodes))
+    page_html = page_html.replace("__CY_EDGES_JSON__", _safe_json_for_script(cy_edges))
+    return page_html
 
 
 @app.get("/degs")
