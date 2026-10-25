@@ -1,6 +1,7 @@
 meta:
   id: replay-pos-0
   name: "Replay-pos-0 — positive control (rote answer-key replay)"
+  display_name: "Positive Control"   # reader-facing; the id and name stay as published
   version: 1
   # ─────────────────────────────────────────────────────────────────────────
   # POSITIVE CONTROL for the LB Design 2 accumulation eval — NOT a thesis task. Its only job is
