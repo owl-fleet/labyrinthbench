@@ -19,6 +19,8 @@ from engine.runner import Session, new_session
 
 DEGS_DIR = Path(os.getenv("DEGS_DIR", Path(__file__).parent.parent / "degs"))
 HISTORY_FILE = Path("/results/.session_history.json")
+EVAL_LOCK_DIR = Path("/results")
+_EVAL_HEARTBEAT_STALE_SECS = 600  # mirrors cli/run_eval.py's _HEARTBEAT_STALE_SECS
 PER_PAGE = 20
 
 app = FastAPI(title="LabyrinthBench", version="0.2.0")
@@ -874,22 +876,44 @@ def score(session_id: str):
 
 @app.get("/eval-status")
 def eval_status():
-    locks = list(Path("/results").glob(".eval_lock_*"))
+    """Read-only liveness report over /results/.eval_lock_* files.
+
+    Never unlinks, renames or writes — a lock the writer (cli/run_eval.py) still holds
+    may belong to a pid outside this process's PID namespace (host or sibling container),
+    so os.kill() alone can't tell live from dead. Liveness falls back to the lock file's
+    own mtime, which _update_heartbeat() rewrites every turn.
+    """
+    locks = sorted(EVAL_LOCK_DIR.glob(".eval_lock_*"))
     if not locks:
         return {"running": False}
-    machines = {}
+    machines: dict[str, dict] = {}
     any_running = False
     for lock_path in locks:
         try:
+            heartbeat_age_s = time.time() - lock_path.stat().st_mtime
+        except OSError:
+            heartbeat_age_s = None
+        try:
             data = json.loads(lock_path.read_text())
-            try:
-                os.kill(data["pid"], 0)
-                machines[data["base_url"]] = {**data, "status": "running"}
-                any_running = True
-            except ProcessLookupError:
-                lock_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+            pid = data["pid"]
+        except (OSError, json.JSONDecodeError, KeyError):
+            machines[lock_path.name] = {"status": "unreadable", "heartbeat_age_s": heartbeat_age_s}
+            any_running = True
+            continue
+        try:
+            os.kill(pid, 0)
+            pid_alive = True
+        except ProcessLookupError:
+            pid_alive = False
+        except OSError:
+            # e.g. PermissionError — pid exists but signal is blocked; treat as alive.
+            pid_alive = True
+        fresh = heartbeat_age_s is not None and heartbeat_age_s < _EVAL_HEARTBEAT_STALE_SECS
+        status = "running" if (pid_alive or fresh) else "stale"
+        if status == "running":
+            any_running = True
+        key = data.get("base_url", lock_path.name)
+        machines[key] = {**data, "status": status, "heartbeat_age_s": heartbeat_age_s}
     return {"running": any_running, "machines": machines}
 
 
