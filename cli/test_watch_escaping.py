@@ -4,11 +4,26 @@ raw, closing the stored-XSS path through POST /session's model field. No live se
 fastapi.testclient.TestClient drives api.main:app in-process, with HISTORY_FILE monkeypatched
 to a temp path so the repo's real history file is never touched.
 """
+import hashlib
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for `import api.main`
+
+REAL_HISTORY_FILE = Path("/results/.session_history.json")
+
+
+def _fingerprint(path):
+    """None if absent, else (st_mtime_ns, sha256 hex) of the file's current bytes."""
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return (stat.st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest())
+
+
+_real_history_before = _fingerprint(REAL_HISTORY_FILE)
 
 import api.main as api_main  # noqa: E402
 
@@ -57,7 +72,7 @@ check("the detail page for a plain model name also renders unescaped",
       "qwen3:14b" in detail_resp2.text)
 
 check("the repo's real history file was never touched",
-      not Path("/results/.session_history.json").exists())
+      _fingerprint(REAL_HISTORY_FILE) == _real_history_before)
 
 print(f"\n{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
