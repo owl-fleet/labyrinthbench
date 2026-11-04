@@ -20,7 +20,7 @@ The model sees the labyrinth as a text-based game, one turn at a time. Each turn
 1. **Look**: describe this room again: its paths, and the question on any locked gate. Looking is free.
 2. **Walk**: take an open path to the next room. Every move through a path costs one step.
 3. **Answer**: give an answer to a locked gate. Correct answers open it. Wrong answers send you to a dead end, or in some mazes, cost one of a limited number of "lives".
-4. **Note**: write yourself a line, and the engine shows it back in every later look. Notes are free. Models rarely use them. In the runs behind this page's numbers, notes appeared in 5 of 30 runs that kept their history and in none of the 30 wiped runs that had a record of answers. Without that record, 3 of 6 runs wrote notes, and every value they recorded for the first gate was wrong.
+4. **Note**: write yourself a line, and the engine shows it back in every later look. Notes are free. Models rarely use them. In the campaigns behind the write-up linked below, notes appeared in 4 of 24 runs that kept their history and in none of the 24 wiped runs that had a record of answers. Without that record, 3 of 6 runs wrote notes, and every value they recorded for the first gate was wrong.
 
 A run ends at the exit, when the lives run out, or when the movement budget is exceeded. The score is how far the model got: the exit, or the number of gates it passed.
 
@@ -111,7 +111,7 @@ Everything the gate needs is on the page: 7 + 5 = 12.
 
 The question names c1a, but nothing says what it was. Looking again only repeats the question. The 7 is gone.
 
-Same model, same maze, same moment. On the Recall Ladder below, a 14B model under strategy 1 stops at a median of three to five gates. Under strategy 2 it reaches the exit in five of six runs. No single part of the switch does it: adding the record of answers to strategy 1 did nothing, adding the fresh look at the current gate to strategy 1 did nothing, and strategy 2 without either one fails to reach the exit.
+Same model, same maze, same moment. On the Recall Ladder below, a 14B model under strategy 1 stops at a median of three to five gates. Under strategy 2 it reaches the exit in five of six runs. No single part of the switch does it: adding the record of answers to strategy 1 did nothing, adding the fresh look at the current gate to strategy 1 did nothing, and strategy 2 missing either one reached the exit in 1 of 23 runs. The full account, with every arm named by its parts, is [the write-up in the data annex](https://labyrinthbench.ai/data/mcv/).
 
 ## Three instruments
 
