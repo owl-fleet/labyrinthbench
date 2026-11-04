@@ -20,6 +20,9 @@ module.exports = function (eleventyConfig) {
   });
   // entries are served as-is so tools (and people) can fetch the raw data
   eleventyConfig.addPassthroughCopy({ "../entries": "entries" });
+  // the explainer's figure, served beside /what-it-is/ so the doc's relative image path
+  // resolves the same way on GitHub and on the site
+  eleventyConfig.addPassthroughCopy({ "../docs/assets/first-labyrinth.svg": "what-it-is/assets/first-labyrinth.svg" });
 
   return {
     dir: { input: "src", includes: "_includes", output: "_site" },

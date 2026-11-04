@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 610" width="760" height="610" role="img" aria-label="The First Labyrinth: four routes to the exit, the shortest passing two locked gates" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#8c959f"/>
+    </marker>
+    <marker id="arrow-hot" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#0969da"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="760" height="610" fill="#ffffff"/>
+  <text x="24" y="34" font-size="15" font-weight="600" fill="#1f2328">Four routes to the exit. The shortest passes two locked gates.</text>
+
+  <!-- open and gated corridors -->
+  <g fill="none" stroke="#8c959f" stroke-width="1.25">
+    <path d="M380 114L190 158" marker-end="url(#arrow)"/>
+    <path d="M126 176H60V96H316" stroke-dasharray="4 4" marker-end="url(#arrow)"/>
+    <path d="M190 194V248" marker-end="url(#arrow)"/>
+    <path d="M570 194L670 248" marker-end="url(#arrow)"/>
+    <path d="M190 284L100 338" marker-end="url(#arrow)"/>
+    <path d="M190 284L280 338" marker-end="url(#arrow)"/>
+    <path d="M670 284V338" marker-end="url(#arrow)"/>
+    <path d="M280 374V428" marker-end="url(#arrow)"/>
+    <path d="M100 374V546H316" marker-end="url(#arrow)"/>
+    <path d="M280 464L360 528" marker-end="url(#arrow)"/>
+    <path d="M670 374V546H444" marker-end="url(#arrow)"/>
+  </g>
+
+  <!-- the shortest route: start, wide space, corridor, exit -->
+  <g fill="none" stroke="#0969da" stroke-width="2">
+    <path d="M380 114L570 158" marker-end="url(#arrow-hot)"/>
+    <path d="M570 194L470 248" marker-end="url(#arrow-hot)"/>
+    <path d="M470 284L400 528" marker-end="url(#arrow-hot)"/>
+  </g>
+
+  <!-- rooms -->
+  <g fill="none" stroke="#8c959f" stroke-width="1.25">
+    <rect x="316" y="78" width="128" height="36" rx="8"/>
+    <rect x="126" y="158" width="128" height="36" rx="8"/>
+    <rect x="506" y="158" width="128" height="36" rx="8"/>
+    <rect x="126" y="248" width="128" height="36" rx="8"/>
+    <rect x="406" y="248" width="128" height="36" rx="8"/>
+    <rect x="606" y="248" width="128" height="36" rx="8"/>
+    <rect x="36" y="338" width="128" height="36" rx="8"/>
+    <rect x="216" y="338" width="128" height="36" rx="8"/>
+    <rect x="606" y="338" width="128" height="36" rx="8"/>
+    <rect x="216" y="428" width="128" height="36" rx="8"/>
+  </g>
+  <rect x="316" y="528" width="128" height="36" rx="8" fill="#0969da" fill-opacity="0.12" stroke="#0969da" stroke-width="2"/>
+
+  <g fill="#1f2328" text-anchor="middle">
+    <text x="380" y="100" font-weight="600">Start</text>
+    <text x="190" y="180">Junction</text>
+    <text x="570" y="180">Wide space</text>
+    <text x="190" y="270">Fork</text>
+    <text x="470" y="270">Corridor</text>
+    <text x="670" y="270">Detour</text>
+    <text x="100" y="360">Clearing</text>
+    <text x="280" y="360">Heavy door</text>
+    <text x="670" y="360">End of detour</text>
+    <text x="280" y="450">Final approach</text>
+    <text x="380" y="550" font-weight="600">Exit</text>
+  </g>
+
+  <!-- gates -->
+  <g font-size="11.5" font-weight="600" fill="#1f2328">
+    <text x="500" y="122">gate: 15 + 28</text>
+    <text x="506" y="214" text-anchor="end">gate: TRUE AND (NOT FALSE)</text>
+    <text x="136" y="314" text-anchor="end">gate: 15 × 4</text>
+    <text x="660" y="315" text-anchor="end">gate: 100 ÷ 4</text>
+    <text x="270" y="405" text-anchor="end">gate: NOT (FALSE OR FALSE)</text>
+  </g>
+  <text x="68" y="140" font-size="11.5" fill="#656d76">loops back</text>
+
+  <text x="24" y="590" font-size="11.5" fill="#656d76">A wrong answer at any gate drops you in a dead end. Highlighted: the shortest route.</text>
+</svg>
