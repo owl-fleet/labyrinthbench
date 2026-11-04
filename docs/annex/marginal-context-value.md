@@ -1,6 +1,6 @@
 # What in an agent's context is load-bearing? Wipe, refresh and recall on a 20-gate maze
 
-*Substrate: nav-3, the 20-gate recall and synthesis ramp (manifest public in `degs/`, reader-facing name "Recall Ladder"). Each experiment's design and falsifiers were written down before its first row was read. Model names are literal. Every number is a point estimate at the n stated beside it. The raw rows behind every table ship with this brief (see Data).*
+*Substrate: nav-3, the 20-gate recall and synthesis ramp (manifest public in `degs/`, reader-facing name "Recall Ladder"). Each experiment's design and falsifiers were written down before its first row was read. Model names are literal. Every number is a point estimate at the n stated beside it. The raw rows behind every table ship with this brief (see Data). If the maze is new to you, [What LabyrinthBench is](https://labyrinthbench.ai/what-it-is/) explains it in a page.*
 
 ## Abstract
 
@@ -106,7 +106,7 @@ A repeat-wrong is a wrong answer the model had already been told was wrong at th
 
 ## 4. Discussion
 
-**What I think this says, at the n above.** On nav-3, for qwen3:14b, the history the model accumulates is a liability it cannot use well: given a fresh view, it does worse with its history than without, and it re-derives a rejected answer from its own earlier reasoning. Taking the history away is not enough on its own, because the model does not look again after failing, and the harness's free refresh does that looking for it. Taking the history away also removes the values the next gate needs, so a one-line record of passed answers has to come back in. Wipe, refresh and recall are each necessary here, and none is sufficient.
+On nav-3, for qwen3:14b, the history the model accumulates is a liability it cannot use well: given a fresh view, it does worse with its history than without, and it re-derives a rejected answer from its own earlier reasoning. Taking the history away is not enough on its own, because the model does not look again after failing, and the harness's free refresh does that looking for it. Taking the history away also removes the values the next gate needs, so a one-line record of passed answers has to come back in. Wipe, refresh and recall are each necessary here, and none is sufficient.
 
 On llama3.3:70b the same wipe costs depth instead of buying it, and the cost is not paid back by preventing repetition. It is paid back by the ordered record of what the model did and what happened. I read that as: a larger model can use more of its past than the 14B can, and the useful part is the record of outcomes, not the replay of reasoning.
 
