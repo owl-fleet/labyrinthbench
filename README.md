@@ -16,6 +16,8 @@ Here's what a run looks like, live — a 14B model exploring one of the maze map
 
 ![A live run in the watch view: the map above, the action log below](docs/assets/watch.gif)
 
+New here? Start with [What LabyrinthBench is](docs/what-labyrinthbench-is.md): the mazes, the four moves, one gate seen under three context strategies, and what the benchmark does and does not measure.
+
 **Who it's for:** people who run agentic AI models and want to know what one actually does 30 turns into a task.
 **What it is:** a deterministically scored multi-turn benchmark.
 **When to use it:** before trusting a model in a long-horizon loop; when tuning a context strategy.
