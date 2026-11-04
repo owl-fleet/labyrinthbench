@@ -2,6 +2,7 @@
 meta:
   id: rev-2
   name: "Rev-2 \u2014 interference + self-pollution (break the frontier)"
+  display_name: "Changing Answers"   # reader-facing; the id and name stay as published
   version: 1
   optimal_commits: 34
   optimal_path:
