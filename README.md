@@ -114,6 +114,36 @@ Enforcement flags stack on top of any policy. `--look-gate` is the shipped examp
 
 Information alone kept failing: inject the full authoritative game state every turn and every scored model answers every gate correctly — and the models that couldn't find the exit still can't. Same story at the instruction level: on the 34-gate map, qwen3:14b answers before looking — median depth 4.5, every wrong answer an unobserved guess. A one-line instruction to observe first — with the pass bar locked before it ran, same as every experiment here — moved the median to 5.5, inside noise, guesses intact. A five-line interceptor that converts any answer at an unobserved gate into an observation took the same model to median 21+, zero guesses across all 12 forced runs. That's why the harness ships `--look-gate` as a flag and not as a suggestion in the system prompt. Full brief in the [annex](https://labyrinthbench.ai/data).
 
+## The memory arm (optional, needs a server you run yourself)
+
+Nothing above needs this. `run_eval.py --arm A0|A1|A2|A2W|A2R|A3|A4` turns on a cross-run memory axis: after each run the harness writes a short record of what happened (forged constants, gates passed, outcome), and before each run, depending on the arm, it reads back what earlier runs left. A0 never reads (the control: the store fills identically, the model just never sees it), A1 does a flat vector search, A2 adds routing, the currency dam and the fork on the server side, and A2W, A2R, A3 and A4 are the widened-window, recency-sorted and ablation variants. The code is `cli/accum_mem.py`. The record is byte-identical across arms except `metadata.arm`, so the arms differ only in what they read.
+
+It talks to a retrieval service of mine over HTTP, which is not in this repo. If you want to run the arm against your own store, it has to speak this much of the API (`--mem-ingest-url` or `$MEM_INGEST_URL`, default `http://localhost:8080`; `$MEM_SCORE_THRESHOLD` default 0.55 and `$MEM_WIDE_TOP_K` default 40 are the other knobs):
+
+* `POST /ingest/document` with `{"source_uri": "labyrinth://<arm>/<deg_id>/<session_id>", "source_type": "labyrinth_session", "collection": "labyrinth/<arm>/<family>", "retention": "prunable", "text": "<run summary>", "metadata": {arm, deg_id, deg_family, deg_variant, run_index, outcome, found_exit, ramp_depth, gate_answers, derived, ts, asserted_facts}}`. It must be synchronous and idempotent on the text, and answer `{"chunks_written": n, "chunks_skipped": m}`; the client retries until `chunks_written + chunks_skipped >= 1`, because a 202 with nothing written would silently break the learning curve.
+* `POST /search` with `{"query_text", "top_k", "score_threshold", "route", "currency", "fork", "source_type_filter": "labyrinth_session", "include_lineage": true, "collection", "collection_subtree"}` (the last two only when scoping to a family). `include_lineage` is there to bypass any result cache, so run N sees runs 1 to N-1. It answers either a bare list of rows or `{"results": [...], "verdict": {...}}`; each row needs `raw_text` (the harness parses `K=` and `run #` out of it) and may carry `currency_dammed`. A store that ignores `route`, `currency` and `fork` simply makes A2 behave like A1.
+
+`python3 cli/accum_mem.py` runs the plumbing smoke against whatever URL you point it at: write one record, read it back through `/search`, assert it round-trips.
+
+One older path reads and writes a table directly rather than going through the HTTP API: `cli/run_oracle.py` with `--db-url` (or `$DB_DSN`), through the knowledge companion module (`companion/modules/kos.py`) and its session write. Without a database it runs without them. They need a Postgres table `knowledge_items`, which `migrate.sql` does not create (it only defines `labyrinth_runs`). The minimal shape they touch:
+
+```sql
+CREATE TABLE IF NOT EXISTS knowledge_items (
+    id           bigserial PRIMARY KEY,
+    source_type  text        NOT NULL,           -- 'labyrinth_session' (written by run_oracle) or 'seed_doc' (read by the kos module)
+    raw_text     text        NOT NULL,
+    collection   text,
+    retention    text,                           -- 'permanent' when the run found the exit, else 'prunable'
+    metadata     jsonb       NOT NULL DEFAULT '{}',  -- deg_id, model, found_exit, gate_accuracy, steps_to_exit, label
+    content_hash text        UNIQUE,             -- sha256 of the session text; the insert is skipped when it exists
+    ingested_at  timestamptz NOT NULL DEFAULT now(),
+    text_search  tsvector GENERATED ALWAYS AS (to_tsvector('english', raw_text)) STORED
+);
+CREATE INDEX IF NOT EXISTS knowledge_items_text_search ON knowledge_items USING gin (text_search);
+```
+
+Nobody has to run any of this to reproduce a board entry.
+
 ## What the first experiment found
 
 It surprised me in both directions. On the 20-gate corridor, I ran 13 local models twice over: once keeping the full chat history, once with context wiped every turn and only the model's own recorded gate answers re-injected — six runs per model per condition. The pass bar — median depth up 5 or more gates — was locked before any wiped run existed.
