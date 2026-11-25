@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from pydantic import BaseModel
@@ -24,7 +23,8 @@ _EVAL_HEARTBEAT_STALE_SECS = 600  # mirrors cli/run_eval.py's _HEARTBEAT_STALE_S
 PER_PAGE = 20
 
 app = FastAPI(title="LabyrinthBench", version="0.2.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# No CORS middleware: every caller is same-origin (/watch) or server-to-server (curl, the harness, a dashboard's
+# server side), none of which sends a preflight. A browser on another origin gets no cross-origin read or write.
 
 _sessions: dict[str, Session] = {}
 _sandbox_sessions: dict[str, dict] = {}   # external-validation shell-sandbox runs (live event relay; see /sandbox/*)
