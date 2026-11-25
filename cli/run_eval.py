@@ -1513,7 +1513,7 @@ def run_session(
         # incomplete run keeps its real ramp_depth (gates passed) instead of a None. ramp_depth =
         # len(gate_results), matching runner.score(). (Amendment 2026-07-06: previously an
         # incomplete run recorded only {"error": ...} and lost its depth — the Wali arm hit the
-        # same gap and worked around it in run_wali.py.)
+        # same gap and worked around it in its own driver, since removed.)
         st = client.get(f"/session/{session_id}/state")
         state = st.json() if st.status_code == 200 else {}
         score_data = {
