@@ -52,7 +52,7 @@ Full dependencies for the API and harness: `pip install -r requirements.txt` (pl
 
 ## Rules
 
-- **Branch and PR, never push `main`.** Main is not locked against direct pushes, so this rule is on you. Create a branch, push it, open a PR; CI is the merge gate.
+- **Branch and PR, never push `main`.** A server-side `protect-main` ruleset refuses direct pushes to `main`, but tags are not covered by a ruleset, so this rule and the deny list in `.claude/settings.json` are the guard for both. Create a branch, push it, open a PR; CI is the merge gate.
 - **Never create or push a tag.** A `v*` tag builds and publishes the public container image (`.github/workflows/publish-image.yml`).
 - **Never hand-edit `entries/`, committed traces under `results/`, or `degs/` manifests.** They are replay-verified; an entry that fails replay does not exist for the board, and a manifest edit changes what every instance means. Data changes go through the tools that produce them, with the verification commands above passing.
 - **Run `bash scripts/pre-push-scan.sh` before every push**, and never commit anything in its categories: operator identity, email addresses, private-network addresses, host mount paths, keys, connection strings, internal service names, private-notebook paths. This is a public repository. CI runs the same scan server-side; a hit fails the PR.
